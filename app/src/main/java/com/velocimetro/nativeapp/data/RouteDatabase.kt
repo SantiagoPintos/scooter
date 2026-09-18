@@ -3,13 +3,19 @@ package com.velocimetro.nativeapp.data
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
-import android.location.Location
-import com.velocimetro.nativeapp.core.DashboardStats
-import com.velocimetro.nativeapp.core.RouteSummary
+import android.content.ContentValues
+import com.velocimetro.nativeapp.domain.model.DashboardStats
+import com.velocimetro.nativeapp.domain.model.RoutePoint
+import com.velocimetro.nativeapp.domain.model.RouteSummary
 import kotlin.math.ceil
 
-/** SQLite directo: inserciones pequeñas y predecibles durante la ruta. */
-class RouteDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
+/** SQLite data source. Only repository implementations should reference this class. */
+internal class RouteDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        db.setForeignKeyConstraintsEnabled(true)
+    }
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -43,24 +49,26 @@ class RouteDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME,
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
     fun startRoute(startedAt: Long): Long {
-        writableDatabase.execSQL("INSERT INTO routes(started_at) VALUES(?)", arrayOf<Any?>(startedAt))
-        return writableDatabase.rawQuery("SELECT last_insert_rowid()", null).use {
-            it.moveToFirst()
-            it.getLong(0)
-        }
+        return requireNotNull(
+            writableDatabase.insertOrThrow(
+                "routes",
+                null,
+                ContentValues(1).apply { put("started_at", startedAt) },
+            ),
+        ) { "SQLite did not return an id for the new route" }
     }
 
-    fun appendPoint(routeId: Long, location: Location) {
+    fun appendPoint(routeId: Long, point: RoutePoint) {
         writableDatabase.execSQL(
             """INSERT INTO route_points(route_id, recorded_at, latitude, longitude, speed_mps, accuracy_meters)
                 VALUES(?, ?, ?, ?, ?, ?)""",
             arrayOf<Any?>(
                 routeId,
-                location.time,
-                location.latitude,
-                location.longitude,
-                location.speed,
-                location.accuracy,
+                point.recordedAt,
+                point.latitude,
+                point.longitude,
+                point.speedMps,
+                point.accuracyMeters,
             ),
         )
     }
@@ -86,6 +94,22 @@ class RouteDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME,
         }
     }
 
+    /**
+     * A foreground service can be killed without receiving an orderly stop. The last point and
+     * route totals are checkpointed on every accepted sample, so closing this orphaned session
+     * makes the durable portion visible again instead of silently losing it from the history.
+     */
+    fun closeInterruptedRoutes() {
+        writableDatabase.execSQL(
+            """UPDATE routes
+                SET ended_at = COALESCE(
+                    (SELECT MAX(recorded_at) FROM route_points WHERE route_id = routes.id),
+                    started_at
+                )
+                WHERE ended_at IS NULL""",
+        )
+    }
+
     fun recentRoutes(limit: Int = 30): List<RouteSummary> = readableDatabase.rawQuery(
         """SELECT id, started_at, ended_at, distance_meters, max_speed_mps, average_speed_mps
             FROM routes WHERE ended_at IS NOT NULL ORDER BY started_at DESC LIMIT ?""",
@@ -108,10 +132,21 @@ class RouteDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME,
     }
 
     fun dashboardStats(now: Long = System.currentTimeMillis()): DashboardStats {
-        val average = readableDatabase.rawQuery(
-            "SELECT COALESCE(AVG(average_speed_mps), 0) FROM routes WHERE ended_at IS NOT NULL AND distance_meters > 0",
+        val (completedDistance, completedDurationMillis) = readableDatabase.rawQuery(
+            """SELECT COALESCE(SUM(distance_meters), 0), COALESCE(SUM(ended_at - started_at), 0)
+                FROM routes
+                WHERE ended_at IS NOT NULL AND ended_at > started_at AND distance_meters > 0""",
             null,
-        ).use { cursor -> cursor.moveToFirst(); cursor.getFloat(0) }
+        ).use { cursor ->
+            cursor.moveToFirst()
+            cursor.getDouble(0) to cursor.getLong(1)
+        }
+        // Aggregate distance / aggregate time keeps long routes from being underweighted.
+        val average = if (completedDurationMillis > 0) {
+            (completedDistance / (completedDurationMillis / 1_000.0)).toFloat()
+        } else {
+            0f
+        }
         val (totalDistance, firstRouteAt) = readableDatabase.rawQuery(
             """SELECT COALESCE(SUM(distance_meters), 0), MIN(started_at)
                 FROM routes WHERE ended_at IS NOT NULL""",

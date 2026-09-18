@@ -8,7 +8,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.isSystemInDarkTheme
-import com.velocimetro.nativeapp.core.ThemePreference
+import com.velocimetro.nativeapp.domain.model.ThemePreference
 
 private val NightColors = darkColorScheme(
     primary = Color(0xFF7DD3FC),

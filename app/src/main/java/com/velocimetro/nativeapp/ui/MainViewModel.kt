@@ -1,28 +1,23 @@
 package com.velocimetro.nativeapp.ui
 
 import android.app.Application
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.velocimetro.nativeapp.core.DashboardStats
-import com.velocimetro.nativeapp.core.DashboardWidget
-import com.velocimetro.nativeapp.core.RouteSummary
-import com.velocimetro.nativeapp.core.ThemePreference
-import com.velocimetro.nativeapp.data.RouteDatabase
-import com.velocimetro.nativeapp.data.SettingsRepository
-import com.velocimetro.nativeapp.tracking.LocationTrackingService
-import com.velocimetro.nativeapp.tracking.TrackingStore
+import com.velocimetro.nativeapp.AppContainer
+import com.velocimetro.nativeapp.domain.model.DashboardStats
+import com.velocimetro.nativeapp.domain.model.DashboardWidget
+import com.velocimetro.nativeapp.domain.model.RouteSummary
+import com.velocimetro.nativeapp.domain.model.ThemePreference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-    private val database = RouteDatabase(application)
-    private val settingsRepository = SettingsRepository(application)
+    private val dependencies = AppContainer.from(application)
 
-    val tracking = TrackingStore.snapshot
-    val settings = settingsRepository.settings
+    val tracking = dependencies.observeTracking()
+    val settings = dependencies.observeSettings()
 
     private val mutableRoutes = MutableStateFlow<List<RouteSummary>>(emptyList())
     val routes: StateFlow<List<RouteSummary>> = mutableRoutes
@@ -40,25 +35,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startTracking() {
-        ContextCompat.startForegroundService(
-            getApplication(),
-            LocationTrackingService.startIntent(getApplication()),
-        )
+        dependencies.startTracking()
     }
 
     fun stopTracking() {
-        getApplication<Application>().startService(LocationTrackingService.stopIntent(getApplication()))
+        dependencies.stopTracking()
     }
 
     fun refreshHistory() {
         viewModelScope.launch {
-            mutableRoutes.value = database.recentRoutes()
-            mutableStats.value = database.dashboardStats()
+            val history = dependencies.loadDashboardHistory()
+            mutableRoutes.value = history.routes
+            mutableStats.value = history.stats
         }
     }
 
-    fun setTheme(theme: ThemePreference) = settingsRepository.setTheme(theme)
+    fun setTheme(theme: ThemePreference) = dependencies.changeTheme(theme)
 
     fun toggleWidget(widget: DashboardWidget, enabled: Boolean) =
-        settingsRepository.toggleWidget(widget, enabled)
+        dependencies.setDashboardWidgetVisibility(widget, enabled)
 }

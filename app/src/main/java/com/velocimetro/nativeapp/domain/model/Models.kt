@@ -1,8 +1,17 @@
-package com.velocimetro.nativeapp.core
+package com.velocimetro.nativeapp.domain.model
 
+/** Immutable application entities. They contain no Android or persistence types. */
 data class GeoPoint(
     val latitude: Double,
     val longitude: Double,
+)
+
+data class RoutePoint(
+    val recordedAt: Long,
+    val latitude: Double,
+    val longitude: Double,
+    val speedMps: Float,
+    val accuracyMeters: Float,
 )
 
 data class TrackingSnapshot(

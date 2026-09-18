@@ -1,10 +1,11 @@
-package com.velocimetro.nativeapp.core
+package com.velocimetro.nativeapp.ui
 
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 
+/** Presentation-only formatting. Domain entities keep raw SI values. */
 fun Float.toKmh(): Float = this * 3.6f
 
 fun Double.formatKm(): String = String.format(Locale.getDefault(), "%.2f km", this / 1_000.0)

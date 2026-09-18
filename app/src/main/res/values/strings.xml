@@ -3,4 +3,5 @@
     <string name="tracking_channel_name">Registro de ruta</string>
     <string name="tracking_notification_title">Registrando ruta</string>
     <string name="tracking_notification_text">El GPS sigue calculando tu recorrido.</string>
+    <string name="tracking_notification_stop">Finalizar</string>
 </resources>

@@ -1,15 +1,16 @@
 package com.velocimetro.nativeapp.tracking
 
-import com.velocimetro.nativeapp.core.TrackingSnapshot
+import com.velocimetro.nativeapp.domain.model.TrackingSnapshot
+import com.velocimetro.nativeapp.domain.repository.TrackingStateRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /** Canal en memoria entre el servicio y la interfaz; la fuente durable es SQLite. */
-object TrackingStore {
+object TrackingStore : TrackingStateRepository {
     private val mutableSnapshot = MutableStateFlow(TrackingSnapshot())
-    val snapshot: StateFlow<TrackingSnapshot> = mutableSnapshot
+    override val snapshot: StateFlow<TrackingSnapshot> = mutableSnapshot
 
-    fun publish(value: TrackingSnapshot) {
-        mutableSnapshot.value = value
+    override fun publish(snapshot: TrackingSnapshot) {
+        mutableSnapshot.value = snapshot
     }
 }

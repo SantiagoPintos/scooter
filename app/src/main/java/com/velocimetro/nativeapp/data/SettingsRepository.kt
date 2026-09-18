@@ -1,20 +1,22 @@
 package com.velocimetro.nativeapp.data
 
 import android.content.Context
-import com.velocimetro.nativeapp.core.AppSettings
-import com.velocimetro.nativeapp.core.DashboardWidget
-import com.velocimetro.nativeapp.core.ThemePreference
+import com.velocimetro.nativeapp.domain.model.AppSettings
+import com.velocimetro.nativeapp.domain.model.DashboardWidget
+import com.velocimetro.nativeapp.domain.model.ThemePreference
+import com.velocimetro.nativeapp.domain.repository.SettingsRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
-class SettingsRepository(context: Context) {
+/** SharedPreferences-backed implementation of the domain settings contract. */
+class SharedPreferencesSettingsRepository(context: Context) : SettingsRepository {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val mutableSettings = MutableStateFlow(read())
-    val settings: StateFlow<AppSettings> = mutableSettings
+    override val settings: StateFlow<AppSettings> = mutableSettings
 
-    fun setTheme(theme: ThemePreference) = save(mutableSettings.value.copy(theme = theme))
+    override fun setTheme(theme: ThemePreference) = save(mutableSettings.value.copy(theme = theme))
 
-    fun toggleWidget(widget: DashboardWidget, enabled: Boolean) {
+    override fun setWidgetEnabled(widget: DashboardWidget, enabled: Boolean) {
         val widgets = mutableSettings.value.widgets.toMutableSet().apply {
             if (enabled) add(widget) else remove(widget)
         }
