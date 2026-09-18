@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Velocímetro</string>
+    <string name="tracking_channel_name">Registro de ruta</string>
+    <string name="tracking_notification_title">Registrando ruta</string>
+    <string name="tracking_notification_text">El GPS sigue calculando tu recorrido.</string>
+</resources>
