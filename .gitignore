@@ -1,6 +1,11 @@
 .gradle/
+.gradle-scooterlab/
+.android-scooterlab/
+.kotlin/
 build/
 app/build/
 local.properties
 *.iml
 .idea/
+scooterlab/tools/
+scooterlab/local/

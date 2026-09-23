@@ -14,5 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Velocimetro"
-include(":app")
+rootProject.name = "ScooterLab"
+include(":scooterlab")
+include(":scooterlabapp")
