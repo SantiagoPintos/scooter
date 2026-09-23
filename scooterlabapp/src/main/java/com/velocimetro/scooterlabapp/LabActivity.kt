@@ -23,7 +23,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import com.velocimetro.scooterlab.AndroidScooterAuthTransport
 import com.velocimetro.scooterlab.MiotBleApplicationCipher
 import com.velocimetro.scooterlab.MiotBleSpecV2Codec
 import com.velocimetro.scooterlab.MiotBleSpecRequestCounter
@@ -39,11 +38,6 @@ import com.velocimetro.scooterlab.ScooterApplicationChannelState
 import com.velocimetro.scooterlab.ScooterChannelPacket
 import com.velocimetro.scooterlab.MiotScooterCommandComposer
 import com.velocimetro.scooterlab.MiotScooterCommandState
-import com.velocimetro.scooterlab.ScooterAuthTransportListener
-import com.velocimetro.scooterlab.ScooterAuthTransportState
-import com.velocimetro.scooterlab.ScooterAuthenticationController
-import com.velocimetro.scooterlab.ScooterHandshakeState
-import com.velocimetro.scooterlab.ScooterSecretProvider
 import java.io.File
 import java.util.TimeZone
 
@@ -74,12 +68,7 @@ class LabActivity : Activity() {
     private lateinit var scooterNameValue: TextView
     private lateinit var batteryValue: TextView
     private lateinit var setupButton: Button
-    private lateinit var dSpeedButton15: Button
-    private lateinit var dSpeedButton32: Button
-    private lateinit var dSpeedStatus: TextView
-
-    private var transport: AndroidScooterAuthTransport? = null
-    private var controller: ScooterAuthenticationController? = null
+    private var session: ScooterSessionConnection? = null
     private var commandComposer: MiotScooterCommandComposer? = null
     private var batteryReader: MiotScooterBatteryReader? = null
     private var powerModeReader: MiotScooterPowerModeReader? = null
@@ -90,7 +79,6 @@ class LabActivity : Activity() {
     private var testStarted = false
     private var automaticConnectionAttempted = false
     private var pendingLockState: Boolean? = null
-    private var pendingDSpeedLimit: Int? = null
     private var lastKnownLockState: Boolean? = null
     private var lastKnownBatteryPercentage: Int? = null
     private var lastKnownPowerMode: Int? = null
@@ -129,12 +117,6 @@ class LabActivity : Activity() {
             composer.state == MiotScooterCommandState.WAITING_RESPONSE
         ) {
             composer.abort()
-            val speedLimit = pendingDSpeedLimit
-            pendingDSpeedLimit = null
-            if (speedLimit != null && ::dSpeedStatus.isInitialized) {
-                dSpeedStatus.text = "No llegó una confirmación para $speedLimit km/h. " +
-                    "Check the current value in Xiaomi Home before retrying."
-            }
             pendingLockState = null
             controlDetail.text = "El scooter no confirmó la orden dentro del tiempo esperado."
             setControlsEnabled(applicationChannel?.state == ScooterApplicationChannelState.READY)
@@ -194,7 +176,8 @@ class LabActivity : Activity() {
         inboundResponseConsumer = null
         applicationChannel?.clear()
         clearPendingApplicationFrames()
-        transport?.close()
+        session?.close()
+        session = null
         super.onDestroy()
     }
 
@@ -220,8 +203,6 @@ class LabActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 visibility = View.GONE
                 addView(readinessCard())
-                addView(spacer(16))
-                addView(dSpeedLimitCard())
                 addView(spacer(16))
                 startButton = Button(this@LabActivity).apply {
                     text = "Reconnect scooter"
@@ -445,49 +426,6 @@ class LabActivity : Activity() {
         ))
     }
 
-    private fun dSpeedLimitCard(): LinearLayout = card().apply {
-        addView(TextView(this@LabActivity).apply {
-            text = "D MODE SPEED LIMIT · EXPERIMENTAL"
-            setTextColor(mutedTextColor)
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.06f
-        })
-        addView(TextView(this@LabActivity).apply {
-            text = "Xiaomi Home exposes 15 and 32 km/h for its US SKU. " +
-                "Choose one value to write it to the scooter."
-            setTextColor(secondaryTextColor)
-            textSize = 14f
-            setPadding(0, dp(8), 0, dp(10))
-        })
-        dSpeedStatus = TextView(this@LabActivity).apply {
-            text = "No speed-limit write sent."
-            setTextColor(secondaryTextColor)
-            textSize = 14f
-            setPadding(0, 0, 0, dp(10))
-        }
-        addView(dSpeedStatus)
-        val buttons = LinearLayout(this@LabActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        dSpeedButton15 = Button(this@LabActivity).apply {
-            text = "Set 15 km/h"
-            isAllCaps = false
-            setOnClickListener { requestDSpeedLimit(15) }
-        }
-        dSpeedButton32 = Button(this@LabActivity).apply {
-            text = "Set 32 km/h"
-            isAllCaps = false
-            setOnClickListener { requestDSpeedLimit(32) }
-        }
-        buttons.addView(dSpeedButton15, LinearLayout.LayoutParams(0, dp(48), 1f))
-        buttons.addView(dSpeedButton32, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-            leftMargin = dp(8)
-        })
-        addView(buttons)
-    }
-
     private fun showDashboard() {
         dashboardContent.visibility = View.VISIBLE
         settingsContent.visibility = View.GONE
@@ -604,99 +542,43 @@ class LabActivity : Activity() {
         startButton.isEnabled = false
         clearPendingApplicationFrames()
         applicationInitializationHandler.removeCallbacksAndMessages(null)
-        // Xiaomi Home opens 001B before beginning security-chip login. The scooter uses that
-        // subscription as a prerequisite for the chip's packet-type 3/5 exchange, even though
-        // those packets themselves travel on 0016.
-        var securityHandshakeStarted = false
-        lateinit var currentTransport: AndroidScooterAuthTransport
-        val currentController = ScooterAuthenticationController(
-            secretProvider = ScooterSecretProvider { effectiveLtmk.copyOf() },
-            frameWriter = { frame -> currentTransport.writeAuthenticationFrame(frame) },
-            observer = { handshakeState, reason ->
-                runOnUiThread { showHandshakeState(handshakeState, reason) }
-            },
-        )
-        currentTransport = AndroidScooterAuthTransport(
-            context = this,
-            device = device,
-            listener = object : ScooterAuthTransportListener {
-                override fun onStateChanged(state: ScooterAuthTransportState) {
-                    runOnUiThread {
-                        if (state != ScooterAuthTransportState.READY) {
-                            showProgress("Preparando conexión", transportDetail(state))
-                            return@runOnUiThread
-                        }
-                        if (currentTransport.enableApplicationResponses()) {
-                            showProgress(
-                                "Preparando canal de respuesta",
-                                "Habilitando el canal requerido antes de autenticar el chip del scooter.",
-                            )
-                        } else {
-                            showFailure("No se pudo preparar el canal de respuesta del scooter.")
-                        }
-                    }
-                }
+        session?.close()
+        session = ScooterSessionConnection(this, device, effectiveLtmk, object : ScooterSessionConnection.Listener {
+            override fun onConnecting(detail: String) {
+                showProgress("Conectando", detail)
+            }
 
-                override fun onAuthenticationFrame(frame: ByteArray) = currentController.onAuthenticationFrame(frame)
+            override fun onAuthenticated(sessionKey: ByteArray) {
+                prepareLaboratoryControls(sessionKey)
+                applicationInitializationHandler.postDelayed(
+                    ::beginApplicationInitializationAfterChannelReceipt,
+                    initialApplicationDeliveryWindowMillis,
+                )
+            }
 
-                override fun onSessionStatusFrame(frame: ByteArray) = currentController.onSessionStatusFrame(frame)
+            override fun onApplicationFrame(frame: ByteArray) = processApplicationFrame(frame)
 
-                override fun onApplicationResponseChannelReady() {
-                    runOnUiThread {
-                        if (!securityHandshakeStarted) {
-                            securityHandshakeStarted = true
-                            currentController.start()
-                        }
-                        showStatus(
-                            title = "Canal de respuesta preparado",
-                            detail = "El canal requerido está listo. Autenticando el chip del scooter " +
-                                "antes de preparar MiOT; no se envió ninguna orden de aplicación.",
-                            color = readyColor,
-                        )
-                    }
-                }
-
-                override fun onApplicationFrame(frame: ByteArray) {
-                    runOnUiThread { handleApplicationFrame(frame) }
-                }
-
-                override fun onTransportFailure(reason: String) {
-                    runOnUiThread {
-                        testStarted = false
-                        showFailure("No se pudo preparar la conexión: $reason")
-                    }
-                }
-            },
-        )
-        controller = currentController
-        transport = currentTransport
+            override fun onFailure(reason: String) {
+                testStarted = false
+                session?.close()
+                session = null
+                showFailure("No se pudo preparar la conexión: $reason")
+            }
+        })
         showProgress("Conectando", "Abriendo únicamente el canal de autenticación Bluetooth…")
-        currentTransport.connect()
+        try {
+            session?.connect()
+        } catch (_: Exception) {
+            testStarted = false
+            session?.close()
+            session = null
+            showFailure("No se pudo abrir la conexión Bluetooth con el scooter.")
+        } finally {
+            effectiveLtmk.fill(0)
+        }
     }
 
-    private fun showHandshakeState(state: ScooterHandshakeState, reason: String?) = when (state) {
-        ScooterHandshakeState.AUTHENTICATED -> {
-            prepareLaboratoryControls(requireNotNull(controller))
-            // Xiaomi Home gives the scooter's optional initial channel delivery a short window
-            // to arrive. If it does, the delivery is acknowledged before the startup flow is
-            // opened. If it does not, startup proceeds after the observed grace window instead
-            // of waiting indefinitely.
-            applicationInitializationHandler.postDelayed(
-                ::beginApplicationInitializationAfterChannelReceipt,
-                initialApplicationDeliveryWindowMillis,
-            )
-        }
-        ScooterHandshakeState.FAILED -> showFailure("La autenticación no se completó${reason?.let { ": $it" } ?: "."}")
-        else -> showProgress("Autenticando", humanize(state.name))
-    }
-
-    private fun prepareLaboratoryControls(currentController: ScooterAuthenticationController) {
-        val sessionKey = try {
-            currentController.authenticatedSessionKey()
-        } catch (error: Exception) {
-            showFailure("La sesión autenticada no entregó el material de aplicación.")
-            return
-        }
+    private fun prepareLaboratoryControls(sessionKey: ByteArray) {
         try {
             commandComposer?.clear()
             applicationChannel?.clear()
@@ -741,7 +623,7 @@ class LabActivity : Activity() {
 
     private fun beginApplicationInitialization() {
         val initializer = applicationInitializer ?: return
-        val currentTransport = transport ?: run {
+        val currentSession = session ?: run {
             showFailure("La conexión Bluetooth ya no está disponible.")
             return
         }
@@ -755,7 +637,7 @@ class LabActivity : Activity() {
                 utcSeconds = nowMillis / 1_000L,
                 utcOffsetSeconds = TimeZone.getDefault().getOffset(nowMillis) / 1_000,
             )
-            currentTransport.writeApplicationFrames(initializer.begin(phoneTime))
+            currentSession.writeApplicationFrames(initializer.begin(phoneTime))
             scheduleStartupFlowFallback(initializer)
         } catch (error: Exception) {
             showFailure("No se pudo iniciar la sincronización del canal de aplicación.")
@@ -779,9 +661,9 @@ class LabActivity : Activity() {
     /** Reads Xiaomi Home's documented UINT8 battery property without changing scooter state. */
     private fun requestBatteryPercentage() {
         val reader = batteryReader ?: return
-        val currentTransport = transport ?: return
+        val currentSession = session ?: return
         try {
-            currentTransport.writeApplicationFrames(reader.begin())
+            currentSession.writeApplicationFrames(reader.begin())
             batteryReadHandler.removeCallbacksAndMessages(null)
             batteryReadHandler.postDelayed({
                 if (batteryReader !== reader || reader.state != MiotScooterBatteryReadState.WAITING_FLOW_ACK) {
@@ -789,7 +671,7 @@ class LabActivity : Activity() {
                 }
                 try {
                     reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
-                        currentTransport.writeApplicationFrames(it)
+                        currentSession.writeApplicationFrames(it)
                     }
                 } catch (_: Exception) {
                     reader.cancel()
@@ -814,9 +696,9 @@ class LabActivity : Activity() {
     /** Reads Xiaomi Home's current riding mode after battery telemetry has completed. */
     private fun requestPowerMode() {
         val reader = powerModeReader ?: return
-        val currentTransport = transport ?: return
+        val currentSession = session ?: return
         try {
-            currentTransport.writeApplicationFrames(reader.begin())
+            currentSession.writeApplicationFrames(reader.begin())
             powerModeReadHandler.removeCallbacksAndMessages(null)
             powerModeReadHandler.postDelayed({
                 if (powerModeReader !== reader || reader.state != MiotScooterPowerModeReadState.WAITING_FLOW_ACK) {
@@ -824,7 +706,7 @@ class LabActivity : Activity() {
                 }
                 try {
                     reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
-                        currentTransport.writeApplicationFrames(it)
+                        currentSession.writeApplicationFrames(it)
                     }
                 } catch (_: Exception) {
                     reader.cancel()
@@ -866,7 +748,7 @@ class LabActivity : Activity() {
             try {
                 val fallbackFrames = initializer.advanceWithoutFlowAcknowledgement()
                 if (fallbackFrames.isNotEmpty()) {
-                    transport?.writeApplicationFrames(fallbackFrames)
+                    session?.writeApplicationFrames(fallbackFrames)
                         ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
                     scheduleStartupDataFallback(initializer)
                 }
@@ -884,7 +766,7 @@ class LabActivity : Activity() {
             try {
                 val nextFlow = initializer.advanceWithoutDataAcknowledgement()
                 if (nextFlow.isNotEmpty()) {
-                    transport?.writeApplicationFrames(nextFlow)
+                    session?.writeApplicationFrames(nextFlow)
                         ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
                     scheduleStartupFlowFallback(initializer)
                 } else if (initializer.state == MiotScooterInitializationState.COMPLETED) {
@@ -924,64 +806,6 @@ class LabActivity : Activity() {
             .show()
     }
 
-    private fun requestDSpeedLimit(valueKmh: Int) {
-        val composer = commandComposer
-        if (applicationChannel?.state != ScooterApplicationChannelState.READY || composer == null) {
-            showFailure("Connect to the scooter and wait until the application channel is ready.")
-            return
-        }
-        if (composer.state == MiotScooterCommandState.WAITING_FLOW_ACK ||
-            composer.state == MiotScooterCommandState.WAITING_DATA_ACK ||
-            composer.state == MiotScooterCommandState.WAITING_RESPONSE
-        ) {
-            showFailure("Another scooter operation is still in progress.")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Set D mode limit to $valueKmh km/h?")
-            .setMessage(
-                if (valueKmh == 32) {
-                    "This sends Xiaomi Home's US SKU maximum for D mode. " +
-                        "The scooter may allow a higher riding speed if it accepts the setting."
-                } else {
-                    "This sends Xiaomi Home's lower US SKU value for D mode."
-                },
-            )
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Send $valueKmh km/h") { _, _ -> beginDSpeedLimit(valueKmh) }
-            .show()
-    }
-
-    private fun beginDSpeedLimit(valueKmh: Int) {
-        val composer = commandComposer ?: return showFailure("The application channel is not ready.")
-        val currentTransport = transport ?: return showFailure("The Bluetooth connection is no longer available.")
-        try {
-            pendingDSpeedLimit = valueKmh
-            val commandFrames = composer.beginDSpeedLimit(valueKmh)
-            setControlsEnabled(false)
-            dSpeedStatus.text = "Sending $valueKmh km/h. Waiting for scooter acknowledgement…"
-            currentTransport.writeApplicationFrames(commandFrames)
-            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
-            commandTimeoutHandler.postDelayed({
-                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
-                try {
-                    val fallbackFrames = composer.advanceWithoutFlowAcknowledgement()
-                    if (fallbackFrames.isNotEmpty()) currentTransport.writeApplicationFrames(fallbackFrames)
-                } catch (_: Exception) {
-                    composer.abort()
-                }
-            }, observedFlowWindowMillis)
-            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
-        } catch (_: Exception) {
-            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
-            composer.abort()
-            pendingDSpeedLimit = null
-            dSpeedStatus.text = "The speed-limit request could not be started."
-            setControlsEnabled(true)
-            showFailure("The D speed-limit request could not be started.")
-        }
-    }
-
     private fun requestLockToggle() {
         when (lastKnownLockState) {
             true -> requestLockChange(locked = false)
@@ -1000,7 +824,7 @@ class LabActivity : Activity() {
             showFailure("El canal de control no está preparado.")
             return
         }
-        val currentTransport = transport ?: run {
+        val currentSession = session ?: run {
             showFailure("La conexión Bluetooth ya no está disponible.")
             return
         }
@@ -1011,13 +835,13 @@ class LabActivity : Activity() {
             setControlsEnabled(false)
             controlDetail.text = "Solicitud de $action iniciada. Esperando el acuse del scooter…"
             showProgress("Orden en curso", "Esperando el acuse del canal de aplicación…")
-            currentTransport.writeApplicationFrames(commandFrames)
+            currentSession.writeApplicationFrames(commandFrames)
             commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
             commandTimeoutHandler.postDelayed({
                 if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
                 try {
                     val fallbackFrames = composer.advanceWithoutFlowAcknowledgement()
-                    if (fallbackFrames.isNotEmpty()) currentTransport.writeApplicationFrames(fallbackFrames)
+                    if (fallbackFrames.isNotEmpty()) currentSession.writeApplicationFrames(fallbackFrames)
                 } catch (_: Exception) {
                     composer.abort()
                 }
@@ -1029,10 +853,6 @@ class LabActivity : Activity() {
             setControlsEnabled(true)
             showFailure("No se pudo iniciar la solicitud de $action.")
         }
-    }
-
-    private fun handleApplicationFrame(frame: ByteArray) = runOnUiThread {
-        processApplicationFrame(frame)
     }
 
     private fun processApplicationFrame(frame: ByteArray) {
@@ -1047,7 +867,7 @@ class LabActivity : Activity() {
             val receivedPacket = channelResult.packet
             val initialPayload = (receivedPacket as? ScooterChannelPacket.SingleControl)?.payload
             if (channelResult.responseFrames.isNotEmpty()) {
-                transport?.writeApplicationResponseFrames(channelResult.responseFrames) {
+                session?.writeApplicationResponseFrames(channelResult.responseFrames) {
                     if (initialPayload != null) {
                         consumeInitialSingleControlPayload(initialPayload)?.let { metadata ->
                             composer.onInboundResponse(metadata)
@@ -1098,7 +918,7 @@ class LabActivity : Activity() {
             if (initializer != null) {
                 val startupFrames = initializer.onApplicationFrame(frame)
                 if (startupFrames.isNotEmpty()) {
-                    transport?.writeApplicationFrames(startupFrames)
+                    session?.writeApplicationFrames(startupFrames)
                         ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
                 }
                 if (initializer.state == MiotScooterInitializationState.WAITING_FLOW_ACK && startupFrames.isNotEmpty()) {
@@ -1124,17 +944,17 @@ class LabActivity : Activity() {
             val nextFrames = composer.onApplicationFrame(frame)
             if (nextFrames.isNotEmpty()) {
                 controlDetail.text = "Acuse recibido. Enviando el dato protegido…"
-                transport?.writeApplicationFrames(nextFrames)
+                session?.writeApplicationFrames(nextFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
             val batteryFrames = batteryReader?.onApplicationFrame(frame).orEmpty()
             if (batteryFrames.isNotEmpty()) {
-                transport?.writeApplicationFrames(batteryFrames)
+                session?.writeApplicationFrames(batteryFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
             val powerModeFrames = powerModeReader?.onApplicationFrame(frame).orEmpty()
             if (powerModeFrames.isNotEmpty()) {
-                transport?.writeApplicationFrames(powerModeFrames)
+                session?.writeApplicationFrames(powerModeFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
             renderCommandState(composer)
@@ -1151,35 +971,21 @@ class LabActivity : Activity() {
         when (composer.state) {
                 MiotScooterCommandState.COMPLETED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
-                    val isSpeedLimitWrite = pendingDSpeedLimit != null
-                    pendingDSpeedLimit?.let { valueKmh ->
-                        dSpeedStatus.text = "Scooter acknowledged the $valueKmh km/h setting. " +
-                            "Check the value shown in Xiaomi Home to confirm it was applied."
-                        pendingDSpeedLimit = null
-                    }
                     pendingLockState?.let { locked ->
                         lastKnownLockState = locked
                         pendingLockState = null
                         updateLockToggleLabel()
                     }
-                    if (!isSpeedLimitWrite) {
-                        controlDetail.text = "El scooter confirmó la recepción. Comprobá visualmente el estado físico."
-                    }
+                    controlDetail.text = "El scooter confirmó la recepción. Comprobá visualmente el estado físico."
                     setControlsEnabled(true)
-                    if (!isSpeedLimitWrite) {
-                        showStatus(
-                            title = "Orden confirmada por el canal",
-                            detail = "El scooter acusó la orden. Verificá el bloqueo o desbloqueo físicamente.",
-                            color = readyColor,
-                        )
-                    }
+                    showStatus(
+                        title = "Orden confirmada por el canal",
+                        detail = "El scooter acusó la orden. Verificá el bloqueo o desbloqueo físicamente.",
+                        color = readyColor,
+                    )
                 }
                 MiotScooterCommandState.FAILED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
-                    pendingDSpeedLimit?.let { valueKmh ->
-                        dSpeedStatus.text = "The scooter rejected the $valueKmh km/h request."
-                        pendingDSpeedLimit = null
-                    }
                     pendingLockState = null
                     controlDetail.text = "El canal rechazó la orden o recibió una respuesta inválida."
                     setControlsEnabled(true)
@@ -1214,8 +1020,6 @@ class LabActivity : Activity() {
 
     private fun setControlsEnabled(enabled: Boolean) {
         if (::lockToggleButton.isInitialized) lockToggleButton.isEnabled = enabled
-        if (::dSpeedButton15.isInitialized) dSpeedButton15.isEnabled = enabled && applicationChannel?.state == ScooterApplicationChannelState.READY
-        if (::dSpeedButton32.isInitialized) dSpeedButton32.isEnabled = enabled && applicationChannel?.state == ScooterApplicationChannelState.READY
     }
 
     private fun updateLockToggleLabel() {
@@ -1229,14 +1033,6 @@ class LabActivity : Activity() {
 
     private fun clearPendingApplicationFrames() {
         while (pendingApplicationFrames.isNotEmpty()) pendingApplicationFrames.removeFirst().fill(0)
-    }
-
-    private fun transportDetail(state: ScooterAuthTransportState): String = when (state) {
-        ScooterAuthTransportState.CONNECTING -> "Conectando por Bluetooth…"
-        ScooterAuthTransportState.NEGOTIATING_MTU -> "Ajustando el canal Bluetooth…"
-        ScooterAuthTransportState.DISCOVERING -> "Buscando el servicio del scooter…"
-        ScooterAuthTransportState.SUBSCRIBING -> "Activando las notificaciones seguras…"
-        else -> humanize(state.name)
     }
 
     private fun showProgress(title: String, detail: String) = showStatus(title, detail, progressColor)
@@ -1472,8 +1268,6 @@ class LabActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun humanize(value: String): String = value.lowercase().replace('_', ' ').replaceFirstChar(Char::titlecase)
-
     private companion object {
         const val logTag = "ScooterLab"
         const val deviceAddressExtra = "device_address"
@@ -1484,7 +1278,7 @@ class LabActivity : Activity() {
         const val batteryReadTimeoutMillis = 3_000L
         const val applicationStartupFinalSettleMillis = 300L
         // Xiaomi Home's first data frame follows the application flow by roughly 80 ms. The
-        // transport itself schedules the flow about 20 ms after it is queued.
+        // The GATT writer schedules the flow about 20 ms after it is queued.
         const val observedFlowWindowMillis = 60L
         const val observedStartupDataWindowMillis = 400L
         const val initialApplicationDeliveryWindowMillis = 350L

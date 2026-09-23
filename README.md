@@ -27,5 +27,8 @@ Build the app and run the protocol tests with:
 .\gradlew.bat :scooterlab:testDebugUnitTest :scooterlabapp:assembleDebug
 ```
 
+For debug signing, credential backup, safe reinstall, and troubleshooting notes, see
+[Scooter Control](scooterlabapp/README.md#development-and-reinstall-notes).
+
 Read [Scooter Lab](scooterlab/README.md), [Scooter Control](scooterlabapp/README.md), and
 [AGENTS.md](AGENTS.md) before changing the BLE flow.

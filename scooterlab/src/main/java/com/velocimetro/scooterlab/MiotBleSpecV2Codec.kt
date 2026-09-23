@@ -68,23 +68,6 @@ object MiotBleSpecV2Codec {
             .array()
     }
 
-    /** Writes only the two D speed limits exposed by Xiaomi Home for its US SKU. */
-    fun setScooterDSpeedLimit(requestId: Int, valueKmh: Int): ByteArray {
-        require(valueKmh == 15 || valueKmh == 32)
-        val typeAndLength = (uint8ValueType shl 12) or uint8ValueLength
-        return header(requestId, 12)
-            .put(setPropertyOpcode.toByte())
-            .put(1.toByte())
-            .put(dSpeedLimitServiceId.toByte())
-            .putShort(dSpeedLimitPropertyId.toShort())
-            .putShort(typeAndLength.toShort())
-            .put(valueKmh.toByte())
-            .array()
-    }
-
-    private const val dSpeedLimitServiceId = 5
-    private const val dSpeedLimitPropertyId = 34
-
     private fun header(requestId: Int, length: Int): ByteBuffer {
         require(requestId in 1..0xffff) { "MiOT request id must be a nonzero unsigned short" }
         return ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
@@ -471,18 +454,6 @@ class MiotScooterCommandComposer private constructor(
             MiotScooterCommandComposer.lockPropertyId, command)
     }
 
-    /** Starts an explicitly requested D speed-limit write (15 or 32 km/h). */
-    fun beginDSpeedLimit(valueKmh: Int): List<ByteArray> {
-        check(
-            state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED ||
-                state == MiotScooterCommandState.FAILED,
-        ) { "An application command is already in progress" }
-        val requestId = requestIds.next()
-        val command = MiotBleSpecV2Codec.setScooterDSpeedLimit(requestId, valueKmh)
-        return beginPropertyWrite(requestId, MiotScooterCommandComposer.dSpeedLimitServiceId,
-            MiotScooterCommandComposer.dSpeedLimitPropertyId, command)
-    }
-
     private fun beginPropertyWrite(
         requestId: Int,
         serviceId: Int,
@@ -597,8 +568,6 @@ class MiotScooterCommandComposer private constructor(
         const val propertyCount = 1
         const val lockServiceId = 4
         const val lockPropertyId = 6
-        const val dSpeedLimitServiceId = 5
-        const val dSpeedLimitPropertyId = 34
     }
 }
 

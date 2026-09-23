@@ -145,7 +145,9 @@ class MiotBleSpecV2CodecTest {
         assertEquals(18, data.payload.size)
 
         assertEquals(emptyList<ByteArray>(), acceptedComposer.onApplicationFrame(ScooterChannelFraming.ack(status = 0)))
-        assertEquals(MiotScooterCommandState.COMPLETED, acceptedComposer.state)
+        // A generic data receipt only confirms transport delivery. The authenticated MiOT
+        // response for this exact property write is what confirms the physical operation.
+        assertEquals(MiotScooterCommandState.WAITING_RESPONSE, acceptedComposer.state)
     }
 
     @Test

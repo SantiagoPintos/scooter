@@ -39,6 +39,18 @@ user-confirmed lock and unlock actions.
 - Add unit tests when changing codecs, counters, framing, or confirmation rules.
 - Before handing off Android changes, run `:scooterlab:testDebugUnitTest` and assemble
   `:scooterlabapp:assembleDebug`.
+- Build and install debug APKs from the same Windows user profile. Android accepts an in-place
+  update only when the APK has the same signing certificate as the installed package. Do not
+  delete or regenerate `%USERPROFILE%\.android\debug.keystore`, and do not use a sandboxed or
+  alternate home directory for a release intended to update the test phone.
+- If Android reports `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, stop before uninstalling. First locate
+  the signing key used by the installed build. If a reinstall is necessary, verify that
+  `scooterlab/local/lab_credential.bin` exists and is 32 bytes before removing the app; restoring
+  it is documented in `scooterlabapp/README.md`. The selected scooter is separate app data and
+  must be selected again after an uninstall.
+- Never restore a credential using shell output redirection into app-private storage. Use
+  `adb shell run-as <package> cp ...` so the file is created with the application's UID, then
+  verify its size only. Do not print or inspect its contents.
 
 ## Next Phase
 
