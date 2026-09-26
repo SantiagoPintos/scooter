@@ -30,6 +30,68 @@ class MiotBleSpecV2CodecTest {
     }
 
     @Test
+    fun chargeLimitUsesConfirmedPropertyAndFivePercentSteps() {
+        val packet = MiotBleSpecV2Codec.setScooterChargeLimit(2, 80)
+        val fields = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        fields.position(6)
+        assertEquals(4, fields.get().toInt() and 0xff)
+        assertEquals(21, fields.short.toInt() and 0xffff)
+        assertEquals(0x1001, fields.short.toInt() and 0xffff)
+        assertEquals(80, fields.get().toInt() and 0xff)
+        try {
+            MiotBleSpecV2Codec.setScooterChargeLimit(2, 82)
+            throw AssertionError("Expected invalid charge target to be rejected")
+        } catch (_: IllegalArgumentException) {
+            // Expected.
+        }
+    }
+
+    @Test
+    fun chargeLimitReaderAcceptsOnlyMatchingSupportedResponse() {
+        val reader = MiotScooterChargeLimitReader(
+            MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64) { (it + 41).toByte() }),
+        )
+        assertEquals(1, reader.begin().size)
+        assertEquals(MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK, reader.state)
+        assertEquals(2, reader.advanceWithoutFlowAcknowledgement().size)
+        val unrelated = MiotInboundPayloadMetadata(14, 14, 2, 3, 1, 4, 6, 0, chargeLimitValue = 85)
+        assertEquals(null, reader.onInboundResponse(unrelated))
+        val matching = MiotInboundPayloadMetadata(14, 14, 2, 3, 1, 4, 21, 0, chargeLimitValue = 85)
+        assertEquals(85, reader.onInboundResponse(matching))
+        assertEquals(MiotScooterChargeLimitReader.State.COMPLETED, reader.state)
+    }
+
+    @Test
+    fun chargeLimitWriteRequiresItsOwnAuthenticatedMiotResponse() {
+        val composer = MiotScooterCommandComposer(ByteArray(64) { (it + 11).toByte() })
+        composer.beginChargeLimit(85)
+        composer.advanceWithoutFlowAcknowledgement()
+        val unrelated = MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 4, 6, 0)
+        assertEquals(false, composer.onInboundResponse(unrelated))
+        assertEquals(MiotScooterCommandState.WAITING_DATA_ACK, composer.state)
+        val matching = MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 4, 21, 0)
+        assertEquals(true, composer.onInboundResponse(matching))
+        assertEquals(MiotScooterCommandState.COMPLETED, composer.state)
+    }
+
+    @Test
+    fun chargeLimitResponseExtractsOnlyValidUint8() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readValue(value: Int): Int? {
+            val plaintext = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or 14).toShort()).putShort(2).put(3).put(1).put(4)
+                .putShort(21).putShort(0).putShort(0).put(value.toByte()).array()
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext))?.chargeLimitValue
+        }
+        assertEquals(85, readValue(85))
+        assertEquals(null, readValue(83))
+    }
+
+    @Test
     fun unlockOnlyChangesTheBooleanValue() {
         val lock = MiotBleSpecV2Codec.setScooterLock(requestId = 7, locked = true)
         val unlock = MiotBleSpecV2Codec.setScooterLock(requestId = 7, locked = false)

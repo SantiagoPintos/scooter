@@ -14,6 +14,9 @@ The protocol research that supports the implementation is under [`docs/`](docs/)
 instrumentation lives in `scooterlab/tools/`, deliberately excluded from Git along with local
 credentials and private captures.
 
+The charge-limit property, read/write flow, and current verification status are documented in
+[Charge limit](docs/CHARGE_LIMIT.md).
+
 ## Development
 
 1. Open the project with Android Studio and JDK 21.

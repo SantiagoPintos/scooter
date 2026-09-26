@@ -13,6 +13,10 @@ authenticated MiOT response before reporting the action as confirmed.
 2. Return to **Dashboard**; future launches reconnect automatically when Bluetooth and the local
    credential are available.
 3. Use the lock control only after the dashboard reports **Connected**.
+4. In **Settings**, wait for the current charge limit to be read, then choose 80–100% in 5%
+   steps. A change requires a separate confirmation. The app reads the value back before
+   treating the requested limit as applied. See [Charge limit](../docs/CHARGE_LIMIT.md) for
+   protocol evidence and the current physical-test status.
 
 The selected Bluetooth address is held in private app preferences. The local credential lives at
 `files/lab_credential.bin`, enables later connections without Xiaomi Home, is never shown in the

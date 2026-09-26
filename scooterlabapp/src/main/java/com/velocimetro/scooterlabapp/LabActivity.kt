@@ -31,6 +31,7 @@ import com.velocimetro.scooterlab.MiotScooterBatteryReader
 import com.velocimetro.scooterlab.MiotScooterBatteryReadState
 import com.velocimetro.scooterlab.MiotScooterPowerModeReader
 import com.velocimetro.scooterlab.MiotScooterPowerModeReadState
+import com.velocimetro.scooterlab.MiotScooterChargeLimitReader
 import com.velocimetro.scooterlab.MiotScooterInboundResponseConsumer
 import com.velocimetro.scooterlab.MiotScooterInitializationState
 import com.velocimetro.scooterlab.ScooterApplicationChannel
@@ -61,6 +62,8 @@ class LabActivity : Activity() {
     private lateinit var controlsCard: LinearLayout
     private lateinit var controlDetail: TextView
     private lateinit var lockToggleButton: Button
+    private lateinit var chargeLimitValue: TextView
+    private lateinit var chargeLimitButton: Button
     private lateinit var dashboardContent: LinearLayout
     private lateinit var settingsContent: LinearLayout
     private lateinit var dashboardTabButton: Button
@@ -72,6 +75,7 @@ class LabActivity : Activity() {
     private var commandComposer: MiotScooterCommandComposer? = null
     private var batteryReader: MiotScooterBatteryReader? = null
     private var powerModeReader: MiotScooterPowerModeReader? = null
+    private var chargeLimitReader: MiotScooterChargeLimitReader? = null
     private var applicationInitializer: MiotScooterApplicationInitializer? = null
     private var inboundResponseConsumer: MiotScooterInboundResponseConsumer? = null
     private var applicationChannel: ScooterApplicationChannel? = null
@@ -79,6 +83,9 @@ class LabActivity : Activity() {
     private var testStarted = false
     private var automaticConnectionAttempted = false
     private var pendingLockState: Boolean? = null
+    private var pendingChargeLimit: Int? = null
+    private var pendingChargeVerification: Int? = null
+    private var lastKnownChargeLimit: Int? = null
     private var lastKnownLockState: Boolean? = null
     private var lastKnownBatteryPercentage: Int? = null
     private var lastKnownPowerMode: Int? = null
@@ -91,6 +98,7 @@ class LabActivity : Activity() {
     private val applicationInitializationHandler = Handler(Looper.getMainLooper())
     private val batteryReadHandler = Handler(Looper.getMainLooper())
     private val powerModeReadHandler = Handler(Looper.getMainLooper())
+    private val chargeLimitReadHandler = Handler(Looper.getMainLooper())
     private val automaticConnectionHandler = Handler(Looper.getMainLooper())
     private val batteryReadTimeoutRunnable = Runnable {
         val reader = batteryReader ?: return@Runnable
@@ -99,6 +107,7 @@ class LabActivity : Activity() {
         ) {
             reader.cancel()
             Log.i(logTag, "Battery read did not return a matching MiOT response; leaving dashboard value unavailable.")
+            requestPowerMode()
         }
     }
     private val powerModeReadTimeoutRunnable = Runnable {
@@ -108,7 +117,21 @@ class LabActivity : Activity() {
         ) {
             reader.cancel()
             Log.i(logTag, "Power-mode read did not return a matching MiOT response; leaving dashboard mode unavailable.")
+            requestChargeLimit()
         }
+    }
+    private val chargeLimitReadTimeoutRunnable = Runnable {
+        chargeLimitReader?.cancel()
+        if (::chargeLimitValue.isInitialized) {
+            chargeLimitValue.text = if (pendingChargeVerification != null) {
+                "Charge limit not verified; reconnect to refresh"
+            } else {
+                "Charge limit unavailable"
+            }
+        }
+        lastKnownChargeLimit = null
+        pendingChargeVerification = null
+        setControlsEnabled(true)
     }
     private val commandTimeoutRunnable = Runnable {
         val composer = commandComposer ?: return@Runnable
@@ -118,6 +141,8 @@ class LabActivity : Activity() {
         ) {
             composer.abort()
             pendingLockState = null
+            pendingChargeLimit = null
+            if (::chargeLimitValue.isInitialized) chargeLimitValue.text = "Charge limit not confirmed; refresh before retrying"
             controlDetail.text = "El scooter no confirmó la orden dentro del tiempo esperado."
             setControlsEnabled(applicationChannel?.state == ScooterApplicationChannelState.READY)
             showFailure("The scooter did not confirm the setting. Check its current state before retrying.")
@@ -166,13 +191,16 @@ class LabActivity : Activity() {
         applicationInitializationHandler.removeCallbacksAndMessages(null)
         batteryReadHandler.removeCallbacksAndMessages(null)
         powerModeReadHandler.removeCallbacksAndMessages(null)
+        chargeLimitReadHandler.removeCallbacksAndMessages(null)
         automaticConnectionHandler.removeCallbacksAndMessages(null)
         commandComposer?.clear()
         batteryReader?.cancel()
         powerModeReader?.cancel()
+        chargeLimitReader?.cancel()
         applicationInitializer = null
         batteryReader = null
         powerModeReader = null
+        chargeLimitReader = null
         inboundResponseConsumer = null
         applicationChannel?.clear()
         clearPendingApplicationFrames()
@@ -203,6 +231,8 @@ class LabActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 visibility = View.GONE
                 addView(readinessCard())
+                addView(spacer(16))
+                addView(chargeLimitCard())
                 addView(spacer(16))
                 startButton = Button(this@LabActivity).apply {
                     text = "Reconnect scooter"
@@ -426,6 +456,31 @@ class LabActivity : Activity() {
         ))
     }
 
+    private fun chargeLimitCard(): LinearLayout = card().apply {
+        addView(TextView(this@LabActivity).apply {
+            text = "CHARGE LIMIT"
+            setTextColor(mutedTextColor)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        chargeLimitValue = TextView(this@LabActivity).apply {
+            text = "Connect to read current limit"
+            setTextColor(primaryTextColor)
+            textSize = 18f
+            setPadding(0, dp(10), 0, dp(12))
+        }
+        addView(chargeLimitValue)
+        chargeLimitButton = Button(this@LabActivity).apply {
+            text = "Set charge limit"
+            isAllCaps = false
+            isEnabled = false
+            setOnClickListener { chooseChargeLimit() }
+        }
+        addView(chargeLimitButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(48),
+        ))
+    }
+
     private fun showDashboard() {
         dashboardContent.visibility = View.VISIBLE
         settingsContent.visibility = View.GONE
@@ -542,6 +597,7 @@ class LabActivity : Activity() {
         startButton.isEnabled = false
         clearPendingApplicationFrames()
         applicationInitializationHandler.removeCallbacksAndMessages(null)
+        chargeLimitReadHandler.removeCallbacksAndMessages(null)
         session?.close()
         session = ScooterSessionConnection(this, device, effectiveLtmk, object : ScooterSessionConnection.Listener {
             override fun onConnecting(detail: String) {
@@ -584,6 +640,10 @@ class LabActivity : Activity() {
             applicationChannel?.clear()
             lastKnownBatteryPercentage = null
             lastKnownPowerMode = null
+            lastKnownChargeLimit = null
+            pendingChargeLimit = null
+            pendingChargeVerification = null
+            chargeLimitValue.text = "Reading charge limit…"
             renderDashboardTelemetry()
             // Xiaomi Home restarts this counter on every authenticated BLE session. Its first
             // outbound opening request is 2, while next() increments before returning a value.
@@ -594,6 +654,7 @@ class LabActivity : Activity() {
             commandComposer = MiotScooterCommandComposer.forInitializedSession(requestIds, cipher)
             batteryReader = MiotScooterBatteryReader(requestIds, cipher)
             powerModeReader = MiotScooterPowerModeReader(requestIds, cipher)
+            chargeLimitReader = MiotScooterChargeLimitReader(requestIds, cipher)
             applicationInitializer = MiotScooterApplicationInitializer(requestIds, cipher)
             inboundResponseConsumer = MiotScooterInboundResponseConsumer(cipher)
             applicationChannel = ScooterApplicationChannel()
@@ -725,6 +786,46 @@ class LabActivity : Activity() {
         lastKnownPowerMode = mode
         renderDashboardTelemetry()
         Log.i(logTag, "Power-mode read completed for the requested MiOT property.")
+        chargeLimitReadHandler.postDelayed(::requestChargeLimit, observedFlowWindowMillis)
+    }
+
+    private fun requestChargeLimit() {
+        val reader = chargeLimitReader ?: return
+        val currentSession = session ?: return
+        if (reader.state == MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterChargeLimitReader.State.WAITING_RESPONSE
+        ) return
+        try {
+            currentSession.writeApplicationFrames(reader.begin())
+            chargeLimitReadHandler.removeCallbacksAndMessages(null)
+            chargeLimitReadHandler.postDelayed({
+                if (chargeLimitReader !== reader || reader.state != MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            chargeLimitReadHandler.postDelayed(chargeLimitReadTimeoutRunnable, batteryReadTimeoutMillis)
+        } catch (_: Exception) {
+            reader.cancel()
+            chargeLimitValue.text = "Charge limit unavailable"
+        }
+    }
+
+    private fun consumeChargeLimitResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val percentage = chargeLimitReader?.onInboundResponse(metadata) ?: return
+        chargeLimitReadHandler.removeCallbacksAndMessages(null)
+        Log.i(logTag, "Charge-limit read completed for the requested MiOT property.")
+        lastKnownChargeLimit = percentage
+        val requested = pendingChargeVerification
+        pendingChargeVerification = null
+        chargeLimitValue.text = if (requested != null && requested != percentage) {
+            "Current limit: $percentage% · requested $requested% was not applied"
+        } else {
+            "Current limit: $percentage%"
+        }
+        setControlsEnabled(true)
     }
 
     private fun renderDashboardTelemetry() {
@@ -855,6 +956,55 @@ class LabActivity : Activity() {
         }
     }
 
+    private fun chooseChargeLimit() {
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY || lastKnownChargeLimit == null) return
+        val options = arrayOf("80%", "85%", "90%", "95%", "100%")
+        AlertDialog.Builder(this)
+            .setTitle("Charge limit")
+            .setSingleChoiceItems(options, (lastKnownChargeLimit!! - 80) / 5) { dialog, index ->
+                dialog.dismiss()
+                val percentage = 80 + index * 5
+                if (percentage == lastKnownChargeLimit) return@setSingleChoiceItems
+                AlertDialog.Builder(this)
+                    .setTitle("Set charge limit to $percentage%?")
+                    .setMessage("This changes the scooter's charging target.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Confirm") { _, _ -> beginChargeLimitChange(percentage) }
+                    .show()
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun beginChargeLimitChange(percentage: Int) {
+        val composer = commandComposer ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
+            composer.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
+        ) return
+        try {
+            val frames = composer.beginChargeLimit(percentage)
+            pendingChargeLimit = percentage
+            setControlsEnabled(false)
+            chargeLimitValue.text = "Setting $percentage%…"
+            currentSession.writeApplicationFrames(frames)
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            commandTimeoutHandler.postDelayed({
+                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    composer.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { composer.abort() }
+            }, observedFlowWindowMillis)
+            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
+        } catch (_: Exception) {
+            composer.abort()
+            pendingChargeLimit = null
+            chargeLimitValue.text = "Could not set charge limit"
+            setControlsEnabled(true)
+        }
+    }
+
     private fun processApplicationFrame(frame: ByteArray) {
         val channel = applicationChannel
         val composer = commandComposer
@@ -873,6 +1023,7 @@ class LabActivity : Activity() {
                             composer.onInboundResponse(metadata)
                             consumeBatteryResponse(metadata)
                             consumePowerModeResponse(metadata)
+                            consumeChargeLimitResponse(metadata)
                         }
                         renderCommandState(composer)
                         beginApplicationInitializationAfterChannelReceipt()
@@ -902,6 +1053,7 @@ class LabActivity : Activity() {
                     composer.onInboundResponse(responseMetadata)
                     consumeBatteryResponse(responseMetadata)
                     consumePowerModeResponse(responseMetadata)
+                    consumeChargeLimitResponse(responseMetadata)
                     renderCommandState(composer)
                 } else {
                     Log.i(
@@ -957,6 +1109,11 @@ class LabActivity : Activity() {
                 session?.writeApplicationFrames(powerModeFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
+            val chargeLimitFrames = chargeLimitReader?.onApplicationFrame(frame).orEmpty()
+            if (chargeLimitFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(chargeLimitFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
             renderCommandState(composer)
         } catch (error: Exception) {
             commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
@@ -968,9 +1125,18 @@ class LabActivity : Activity() {
     }
 
     private fun renderCommandState(composer: MiotScooterCommandComposer) {
+        if (pendingLockState == null && pendingChargeLimit == null) return
         when (composer.state) {
                 MiotScooterCommandState.COMPLETED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+                    pendingChargeLimit?.let { percentage ->
+                        pendingChargeLimit = null
+                        pendingChargeVerification = percentage
+                        chargeLimitValue.text = "Acknowledged: $percentage% · verifying…"
+                        setControlsEnabled(true)
+                        chargeLimitReadHandler.postDelayed(::requestChargeLimit, observedFlowWindowMillis)
+                        return
+                    }
                     pendingLockState?.let { locked ->
                         lastKnownLockState = locked
                         pendingLockState = null
@@ -986,6 +1152,8 @@ class LabActivity : Activity() {
                 }
                 MiotScooterCommandState.FAILED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+                    if (pendingChargeLimit != null) chargeLimitValue.text = "Charge limit not confirmed; reconnect to refresh"
+                    pendingChargeLimit = null
                     pendingLockState = null
                     controlDetail.text = "El canal rechazó la orden o recibió una respuesta inválida."
                     setControlsEnabled(true)
@@ -1020,6 +1188,9 @@ class LabActivity : Activity() {
 
     private fun setControlsEnabled(enabled: Boolean) {
         if (::lockToggleButton.isInitialized) lockToggleButton.isEnabled = enabled
+        if (::chargeLimitButton.isInitialized) chargeLimitButton.isEnabled = enabled &&
+            applicationChannel?.state == ScooterApplicationChannelState.READY &&
+            lastKnownChargeLimit != null && pendingChargeVerification == null
     }
 
     private fun updateLockToggleLabel() {

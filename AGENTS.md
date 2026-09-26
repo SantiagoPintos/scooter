@@ -27,6 +27,10 @@ user-confirmed lock and unlock actions.
   one inbound protocol consumer.
 - When local setup is available, the Android app reconnects automatically at launch. Scooter
   selection belongs to Settings after the first setup.
+- Charge limit is MiOT `4.21`, with permitted values 80–100% in steps of 5. The authenticated
+  read was observed on the test scooter and matched Xiaomi Home at 80%. The write path is
+  implemented and unit-tested but has not yet had a supervised physical test from Scooter Lab;
+  see `docs/CHARGE_LIMIT.md` before treating it as verified.
 
 ## Safety and Quality Rules
 

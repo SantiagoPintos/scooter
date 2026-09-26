@@ -68,6 +68,18 @@ object MiotBleSpecV2Codec {
             .array()
     }
 
+    /** Writes the confirmed 80–100% charge target as an unsigned byte. */
+    fun setScooterChargeLimit(requestId: Int, percentage: Int): ByteArray {
+        require(percentage in 80..100 && percentage % 5 == 0)
+        return header(requestId, 12)
+            .put(setPropertyOpcode.toByte()).put(1).put(scooterControlSiid.toByte())
+            .putShort(scooterChargeLimitPiid.toShort())
+            .putShort(((uint8ValueType shl 12) or uint8ValueLength).toShort())
+            .put(percentage.toByte()).array()
+    }
+
+    private const val scooterChargeLimitPiid = 21
+
     private fun header(requestId: Int, length: Int): ByteBuffer {
         require(requestId in 1..0xffff) { "MiOT request id must be a nonzero unsigned short" }
         return ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
@@ -454,6 +466,15 @@ class MiotScooterCommandComposer private constructor(
             MiotScooterCommandComposer.lockPropertyId, command)
     }
 
+    fun beginChargeLimit(percentage: Int): List<ByteArray> {
+        check(state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED || state == MiotScooterCommandState.FAILED) {
+            "An application command is already in progress"
+        }
+        val requestId = requestIds.next()
+        return beginPropertyWrite(requestId, chargeLimitServiceId, chargeLimitPropertyId,
+            MiotBleSpecV2Codec.setScooterChargeLimit(requestId, percentage))
+    }
+
     private fun beginPropertyWrite(
         requestId: Int,
         serviceId: Int,
@@ -568,6 +589,8 @@ class MiotScooterCommandComposer private constructor(
         const val propertyCount = 1
         const val lockServiceId = 4
         const val lockPropertyId = 6
+        const val chargeLimitServiceId = 4
+        const val chargeLimitPropertyId = 21
     }
 }
 
@@ -709,6 +732,7 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
             valueTypeAndLength = plaintext.takeIf { it.size >= 11 }?.let { readLittleEndianShort(it, 9) },
             powerModeValue = extractPowerModeValue(plaintext, serviceId, propertyId),
             batteryPercentValue = extractBatteryPercentage(plaintext, serviceId, propertyId),
+            chargeLimitValue = extractChargeLimitValue(plaintext, serviceId, propertyId),
         )
         plaintext.fill(0)
         metadata
@@ -732,7 +756,16 @@ data class MiotInboundPayloadMetadata(
     val valueTypeAndLength: Int?,
     val powerModeValue: Int? = null,
     val batteryPercentValue: Int? = null,
+    val chargeLimitValue: Int? = null,
 )
+
+private fun extractChargeLimitValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
+    if (serviceId != MiotScooterChargeLimitReader.serviceId ||
+        propertyId != MiotScooterChargeLimitReader.propertyId ||
+        plaintext.size != 14 || readLittleEndianShort(plaintext, 9) != 0
+    ) return null
+    return (plaintext.last().toInt() and 0xff).takeIf(MiotScooterChargeLimitReader::isSupported)
+}
 
 /**
  * A successful short MiOT property response carries a two-byte result/type prefix
