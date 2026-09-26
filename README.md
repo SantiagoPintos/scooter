@@ -17,6 +17,9 @@ credentials and private captures.
 The charge-limit property, read/write flow, and current verification status are documented in
 [Charge limit](docs/CHARGE_LIMIT.md).
 
+The standalone XIAO nRF52840 key-fob roadmap is in
+[Remote implementation plan](docs/REMOTE_IMPLEMENTATION_PLAN.md).
+
 ## Development
 
 1. Open the project with Android Studio and JDK 21.
