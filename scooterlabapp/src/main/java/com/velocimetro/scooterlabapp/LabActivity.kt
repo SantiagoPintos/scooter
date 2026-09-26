@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -32,6 +33,8 @@ import com.velocimetro.scooterlab.MiotScooterBatteryReadState
 import com.velocimetro.scooterlab.MiotScooterPowerModeReader
 import com.velocimetro.scooterlab.MiotScooterPowerModeReadState
 import com.velocimetro.scooterlab.MiotScooterChargeLimitReader
+import com.velocimetro.scooterlab.MiotScooterStartingSpeedReader
+import com.velocimetro.scooterlab.MiotScooterChargingStatusReader
 import com.velocimetro.scooterlab.MiotScooterInboundResponseConsumer
 import com.velocimetro.scooterlab.MiotScooterInitializationState
 import com.velocimetro.scooterlab.ScooterApplicationChannel
@@ -64,18 +67,23 @@ class LabActivity : Activity() {
     private lateinit var lockToggleButton: Button
     private lateinit var chargeLimitValue: TextView
     private lateinit var chargeLimitButton: Button
+    private lateinit var startingSpeedValue: TextView
+    private lateinit var startingSpeedButton: Button
     private lateinit var dashboardContent: LinearLayout
     private lateinit var settingsContent: LinearLayout
     private lateinit var dashboardTabButton: Button
     private lateinit var settingsTabButton: Button
     private lateinit var scooterNameValue: TextView
     private lateinit var batteryValue: TextView
+    private lateinit var chargingStatusValue: TextView
     private lateinit var setupButton: Button
     private var session: ScooterSessionConnection? = null
     private var commandComposer: MiotScooterCommandComposer? = null
     private var batteryReader: MiotScooterBatteryReader? = null
     private var powerModeReader: MiotScooterPowerModeReader? = null
     private var chargeLimitReader: MiotScooterChargeLimitReader? = null
+    private var startingSpeedReader: MiotScooterStartingSpeedReader? = null
+    private var chargingStatusReader: MiotScooterChargingStatusReader? = null
     private var applicationInitializer: MiotScooterApplicationInitializer? = null
     private var inboundResponseConsumer: MiotScooterInboundResponseConsumer? = null
     private var applicationChannel: ScooterApplicationChannel? = null
@@ -86,9 +94,14 @@ class LabActivity : Activity() {
     private var pendingChargeLimit: Int? = null
     private var pendingChargeVerification: Int? = null
     private var lastKnownChargeLimit: Int? = null
+    private var pendingStartingSpeed: Int? = null
+    private var pendingStartingVerification: Int? = null
+    private var lastKnownStartingSpeed: Int? = null
     private var lastKnownLockState: Boolean? = null
     private var lastKnownBatteryPercentage: Int? = null
     private var lastKnownPowerMode: Int? = null
+    private var lastKnownChargingStatus: Int? = null
+    private var lastChargingUpdateMillis = 0L
     private var scanner: BluetoothLeScanner? = null
     private var scanning = false
     private val scanHandler = Handler(Looper.getMainLooper())
@@ -99,6 +112,9 @@ class LabActivity : Activity() {
     private val batteryReadHandler = Handler(Looper.getMainLooper())
     private val powerModeReadHandler = Handler(Looper.getMainLooper())
     private val chargeLimitReadHandler = Handler(Looper.getMainLooper())
+    private val startingSpeedReadHandler = Handler(Looper.getMainLooper())
+    private val chargingReadHandler = Handler(Looper.getMainLooper())
+    private val chargingPollRunnable = Runnable { requestChargingStatus() }
     private val automaticConnectionHandler = Handler(Looper.getMainLooper())
     private val batteryReadTimeoutRunnable = Runnable {
         val reader = batteryReader ?: return@Runnable
@@ -132,6 +148,28 @@ class LabActivity : Activity() {
         lastKnownChargeLimit = null
         pendingChargeVerification = null
         setControlsEnabled(true)
+        requestStartingSpeed()
+    }
+    private val startingSpeedReadTimeoutRunnable = Runnable {
+        startingSpeedReader?.cancel()
+        startingSpeedValue.text = if (pendingStartingVerification != null) {
+            "Starting speed not verified; reconnect to refresh."
+        } else {
+            "Starting speed unavailable"
+        }
+        pendingStartingVerification = null
+        lastKnownStartingSpeed = null
+        restoreControlsAfterChargingRead()
+        scheduleChargingStatusRead()
+    }
+    private val chargingReadTimeoutRunnable = Runnable {
+        chargingStatusReader?.cancel()
+        if (SystemClock.elapsedRealtime() - lastChargingUpdateMillis > chargingStatusStaleMillis) {
+            lastKnownChargingStatus = null
+            renderChargingStatus()
+        }
+        restoreControlsAfterChargingRead()
+        scheduleChargingStatusRead()
     }
     private val commandTimeoutRunnable = Runnable {
         val composer = commandComposer ?: return@Runnable
@@ -139,10 +177,19 @@ class LabActivity : Activity() {
             composer.state == MiotScooterCommandState.WAITING_DATA_ACK ||
             composer.state == MiotScooterCommandState.WAITING_RESPONSE
         ) {
+            val startingSpeedAttempt = pendingStartingSpeed
+            val chargeLimitAttempt = pendingChargeLimit
             composer.abort()
             pendingLockState = null
             pendingChargeLimit = null
-            if (::chargeLimitValue.isInitialized) chargeLimitValue.text = "Charge limit not confirmed; refresh before retrying"
+            pendingStartingSpeed = null
+            if (chargeLimitAttempt != null) chargeLimitValue.text =
+                "Charge limit not confirmed; refresh before retrying"
+            if (startingSpeedAttempt != null) {
+                pendingStartingVerification = startingSpeedAttempt
+                startingSpeedValue.text = "No write confirmation; reading back…"
+                startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
+            }
             controlDetail.text = "El scooter no confirmó la orden dentro del tiempo esperado."
             setControlsEnabled(applicationChannel?.state == ScooterApplicationChannelState.READY)
             showFailure("The scooter did not confirm the setting. Check its current state before retrying.")
@@ -192,15 +239,21 @@ class LabActivity : Activity() {
         batteryReadHandler.removeCallbacksAndMessages(null)
         powerModeReadHandler.removeCallbacksAndMessages(null)
         chargeLimitReadHandler.removeCallbacksAndMessages(null)
+        startingSpeedReadHandler.removeCallbacksAndMessages(null)
+        chargingReadHandler.removeCallbacksAndMessages(null)
         automaticConnectionHandler.removeCallbacksAndMessages(null)
         commandComposer?.clear()
         batteryReader?.cancel()
         powerModeReader?.cancel()
         chargeLimitReader?.cancel()
+        startingSpeedReader?.cancel()
+        chargingStatusReader?.cancel()
         applicationInitializer = null
         batteryReader = null
         powerModeReader = null
         chargeLimitReader = null
+        startingSpeedReader = null
+        chargingStatusReader = null
         inboundResponseConsumer = null
         applicationChannel?.clear()
         clearPendingApplicationFrames()
@@ -233,6 +286,8 @@ class LabActivity : Activity() {
                 addView(readinessCard())
                 addView(spacer(16))
                 addView(chargeLimitCard())
+                addView(spacer(16))
+                addView(startingSpeedCard())
                 addView(spacer(16))
                 startButton = Button(this@LabActivity).apply {
                     text = "Reconnect scooter"
@@ -304,6 +359,14 @@ class LabActivity : Activity() {
             setPadding(0, dp(6), 0, 0)
         }
         addView(batteryValue)
+        chargingStatusValue = TextView(this@LabActivity).apply {
+            text = "Cargando"
+            setTextColor(secondaryTextColor)
+            textSize = 15f
+            setPadding(0, dp(6), 0, 0)
+            visibility = View.GONE
+        }
+        addView(chargingStatusValue)
         setupButton = Button(this@LabActivity).apply {
             text = "Choose scooter in Settings"
             isAllCaps = false
@@ -481,6 +544,29 @@ class LabActivity : Activity() {
         ))
     }
 
+    private fun startingSpeedCard(): LinearLayout = card().apply {
+        addView(TextView(this@LabActivity).apply {
+            text = "STARTING SPEED"
+            setTextColor(mutedTextColor)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        startingSpeedValue = TextView(this@LabActivity).apply {
+            text = "Connect to read current value"
+            setTextColor(primaryTextColor)
+            textSize = 18f
+            setPadding(0, dp(10), 0, dp(12))
+        }
+        addView(startingSpeedValue)
+        startingSpeedButton = Button(this@LabActivity).apply {
+            text = "Set starting speed"
+            isAllCaps = false
+            isEnabled = false
+            setOnClickListener { chooseStartingSpeed() }
+        }
+        addView(startingSpeedButton)
+    }
+
     private fun showDashboard() {
         dashboardContent.visibility = View.VISIBLE
         settingsContent.visibility = View.GONE
@@ -531,6 +617,7 @@ class LabActivity : Activity() {
         startButton.isEnabled = ready && !testStarted
         scooterNameValue.text = if (addressReady) selectedTargetName() else "Scooter not selected"
         batteryValue.text = "Battery  —  ·  Range  —"
+        renderChargingStatus()
         setupButton.visibility = if (addressReady) View.GONE else View.VISIBLE
         if (!ready) {
             showStatus(
@@ -598,6 +685,8 @@ class LabActivity : Activity() {
         clearPendingApplicationFrames()
         applicationInitializationHandler.removeCallbacksAndMessages(null)
         chargeLimitReadHandler.removeCallbacksAndMessages(null)
+        startingSpeedReadHandler.removeCallbacksAndMessages(null)
+        chargingReadHandler.removeCallbacksAndMessages(null)
         session?.close()
         session = ScooterSessionConnection(this, device, effectiveLtmk, object : ScooterSessionConnection.Listener {
             override fun onConnecting(detail: String) {
@@ -618,6 +707,17 @@ class LabActivity : Activity() {
                 testStarted = false
                 session?.close()
                 session = null
+                startingSpeedReadHandler.removeCallbacksAndMessages(null)
+                chargingReadHandler.removeCallbacksAndMessages(null)
+                chargingStatusReader?.cancel()
+                lastKnownChargingStatus = null
+                renderChargingStatus()
+                if (pendingStartingSpeed != null || pendingStartingVerification != null || lastKnownStartingSpeed == 0) {
+                    startingSpeedValue.text = "Connection lost; starting speed must be verified again."
+                }
+                pendingStartingSpeed = null
+                pendingStartingVerification = null
+                setControlsEnabled(false)
                 showFailure("No se pudo preparar la conexión: $reason")
             }
         })
@@ -643,8 +743,15 @@ class LabActivity : Activity() {
             lastKnownChargeLimit = null
             pendingChargeLimit = null
             pendingChargeVerification = null
+            pendingStartingSpeed = null
+            pendingStartingVerification = null
+            lastKnownStartingSpeed = null
+            lastKnownChargingStatus = null
+            lastChargingUpdateMillis = 0L
             chargeLimitValue.text = "Reading charge limit…"
+            startingSpeedValue.text = "Reading starting speed…"
             renderDashboardTelemetry()
+            renderChargingStatus()
             // Xiaomi Home restarts this counter on every authenticated BLE session. Its first
             // outbound opening request is 2, while next() increments before returning a value.
             // The scooter's independently-originated initial update can carry another request
@@ -655,6 +762,8 @@ class LabActivity : Activity() {
             batteryReader = MiotScooterBatteryReader(requestIds, cipher)
             powerModeReader = MiotScooterPowerModeReader(requestIds, cipher)
             chargeLimitReader = MiotScooterChargeLimitReader(requestIds, cipher)
+            startingSpeedReader = MiotScooterStartingSpeedReader(requestIds, cipher)
+            chargingStatusReader = MiotScooterChargingStatusReader(requestIds, cipher)
             applicationInitializer = MiotScooterApplicationInitializer(requestIds, cipher)
             inboundResponseConsumer = MiotScooterInboundResponseConsumer(cipher)
             applicationChannel = ScooterApplicationChannel()
@@ -717,6 +826,7 @@ class LabActivity : Activity() {
             color = readyColor,
         )
         requestBatteryPercentage()
+        scheduleChargingStatusRead()
     }
 
     /** Reads Xiaomi Home's documented UINT8 battery property without changing scooter state. */
@@ -826,6 +936,138 @@ class LabActivity : Activity() {
             "Current limit: $percentage%"
         }
         setControlsEnabled(true)
+        startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
+    }
+
+    private fun requestStartingSpeed() {
+        val reader = startingSpeedReader ?: return
+        val currentSession = session ?: return
+        if (reader.state == MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterStartingSpeedReader.State.WAITING_RESPONSE
+        ) return
+        try {
+            currentSession.writeApplicationFrames(reader.begin())
+            startingSpeedReadHandler.removeCallbacksAndMessages(null)
+            startingSpeedReadHandler.postDelayed({
+                if (startingSpeedReader !== reader ||
+                    reader.state != MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK
+                ) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            startingSpeedReadHandler.postDelayed(startingSpeedReadTimeoutRunnable, batteryReadTimeoutMillis)
+            setControlsEnabled(true)
+        } catch (_: Exception) {
+            reader.cancel()
+            startingSpeedValue.text = if (pendingStartingVerification != null) {
+                "Starting speed not verified; reconnect to refresh."
+            } else {
+                "Starting speed unavailable"
+            }
+            pendingStartingVerification = null
+            lastKnownStartingSpeed = null
+            restoreControlsAfterChargingRead()
+            scheduleChargingStatusRead()
+        }
+    }
+
+    private fun consumeStartingSpeedResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val speed = startingSpeedReader?.onInboundResponse(metadata) ?: return
+        startingSpeedReadHandler.removeCallbacksAndMessages(null)
+        lastKnownStartingSpeed = speed
+        val requested = pendingStartingVerification
+        pendingStartingVerification = null
+        startingSpeedValue.text = when {
+            speed == 0 -> "Scooter reports 0 km/h. Do not ride; restore 3–5 km/h."
+            requested != null && requested != speed -> "Scooter reports $speed km/h; $requested was not retained."
+            else -> "Current: $speed km/h"
+        }
+        Log.i(logTag, "Starting-speed read completed for the requested MiOT property.")
+        setControlsEnabled(true)
+        scheduleChargingStatusRead()
+    }
+
+    private fun scheduleChargingStatusRead(delayMillis: Long = chargingPollIntervalMillis) {
+        val reader = chargingStatusReader ?: return
+        if (reader.state == MiotScooterChargingStatusReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterChargingStatusReader.State.WAITING_RESPONSE
+        ) return
+        chargingReadHandler.removeCallbacks(chargingPollRunnable)
+        chargingReadHandler.postDelayed(chargingPollRunnable, delayMillis)
+    }
+
+    private fun requestChargingStatus() {
+        val reader = chargingStatusReader ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY) return
+        if (reader.state == MiotScooterChargingStatusReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterChargingStatusReader.State.WAITING_RESPONSE
+        ) return
+        if (commandComposer?.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE) ||
+            batteryReader?.state in setOf(MiotScooterBatteryReadState.WAITING_FLOW_ACK,
+                MiotScooterBatteryReadState.WAITING_RESPONSE) ||
+            powerModeReader?.state in setOf(MiotScooterPowerModeReadState.WAITING_FLOW_ACK,
+                MiotScooterPowerModeReadState.WAITING_RESPONSE) ||
+            chargeLimitReader?.state in setOf(MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK,
+                MiotScooterChargeLimitReader.State.WAITING_RESPONSE) ||
+            startingSpeedReader?.state in setOf(MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK,
+                MiotScooterStartingSpeedReader.State.WAITING_RESPONSE)
+        ) {
+            scheduleChargingStatusRead(chargingBusyRetryMillis)
+            return
+        }
+        try {
+            currentSession.writeApplicationFrames(reader.begin())
+            chargingReadHandler.removeCallbacksAndMessages(null)
+            chargingReadHandler.postDelayed({
+                if (chargingStatusReader !== reader ||
+                    reader.state != MiotScooterChargingStatusReader.State.WAITING_FLOW_ACK
+                ) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            chargingReadHandler.postDelayed(chargingReadTimeoutRunnable, batteryReadTimeoutMillis)
+            setControlsEnabled(false)
+        } catch (_: Exception) {
+            reader.cancel()
+            if (SystemClock.elapsedRealtime() - lastChargingUpdateMillis > chargingStatusStaleMillis) {
+                lastKnownChargingStatus = null
+                renderChargingStatus()
+            }
+            restoreControlsAfterChargingRead()
+            scheduleChargingStatusRead()
+        }
+    }
+
+    private fun consumeChargingStatusResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val reader = chargingStatusReader ?: return
+        val status = reader.onInboundResponse(metadata) ?: return
+        lastKnownChargingStatus = status
+        lastChargingUpdateMillis = SystemClock.elapsedRealtime()
+        renderChargingStatus()
+        Log.i(logTag, "Charging-status update validated for MiOT property 3.2.")
+        if (reader.state != MiotScooterChargingStatusReader.State.WAITING_FLOW_ACK &&
+            reader.state != MiotScooterChargingStatusReader.State.WAITING_RESPONSE
+        ) {
+            chargingReadHandler.removeCallbacksAndMessages(null)
+            restoreControlsAfterChargingRead()
+            scheduleChargingStatusRead()
+        }
+    }
+
+    private fun renderChargingStatus() {
+        chargingStatusValue.visibility = if (MiotScooterChargingStatusReader.isCharging(lastKnownChargingStatus)) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
     }
 
     private fun renderDashboardTelemetry() {
@@ -921,6 +1163,10 @@ class LabActivity : Activity() {
     }
 
     private fun beginLockChange(locked: Boolean) {
+        if (chargingStatusReadInProgress()) {
+            showFailure("Charging telemetry is updating; retry the lock action shortly.")
+            return
+        }
         val composer = commandComposer ?: run {
             showFailure("El canal de control no está preparado.")
             return
@@ -975,6 +1221,10 @@ class LabActivity : Activity() {
     }
 
     private fun beginChargeLimitChange(percentage: Int) {
+        if (chargingStatusReadInProgress()) {
+            chargeLimitValue.text = "Charging telemetry is updating; retry shortly."
+            return
+        }
         val composer = commandComposer ?: return
         val currentSession = session ?: return
         if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
@@ -1005,6 +1255,61 @@ class LabActivity : Activity() {
         }
     }
 
+    private fun chooseStartingSpeed() {
+        val options = arrayOf("3 km/h", "4 km/h", "5 km/h")
+        val selected = lastKnownStartingSpeed?.takeIf { it in 3..5 }?.minus(3) ?: -1
+        AlertDialog.Builder(this)
+            .setTitle("Starting speed")
+            .setSingleChoiceItems(options, selected) { dialog, index ->
+                dialog.dismiss()
+                val speed = index + 3
+                AlertDialog.Builder(this)
+                    .setTitle("Set starting speed to $speed km/h?")
+                    .setMessage("The scooter must remain stationary. " +
+                        "The app will read the setting back before reporting it applied.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Confirm") { _, _ -> beginStartingSpeedChange(speed) }
+                    .show()
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun beginStartingSpeedChange(speedKmh: Int) {
+        if (chargingStatusReadInProgress()) {
+            startingSpeedValue.text = "Charging telemetry is updating; retry shortly."
+            return
+        }
+        val composer = commandComposer ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
+            composer.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE) ||
+            pendingStartingVerification != null
+        ) return
+        try {
+            val frames = composer.beginStartingSpeed(speedKmh)
+            pendingStartingSpeed = speedKmh
+            lastKnownStartingSpeed = null
+            setControlsEnabled(false)
+            startingSpeedValue.text = "Sending $speedKmh km/h…"
+            currentSession.writeApplicationFrames(frames)
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            commandTimeoutHandler.postDelayed({
+                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    composer.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { composer.abort() }
+            }, observedFlowWindowMillis)
+            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
+        } catch (_: Exception) {
+            composer.abort()
+            pendingStartingSpeed = null
+            startingSpeedValue.text = "Write could not start; reconnect to verify."
+            setControlsEnabled(true)
+        }
+    }
+
     private fun processApplicationFrame(frame: ByteArray) {
         val channel = applicationChannel
         val composer = commandComposer
@@ -1024,6 +1329,8 @@ class LabActivity : Activity() {
                             consumeBatteryResponse(metadata)
                             consumePowerModeResponse(metadata)
                             consumeChargeLimitResponse(metadata)
+                            consumeStartingSpeedResponse(metadata)
+                            consumeChargingStatusResponse(metadata)
                         }
                         renderCommandState(composer)
                         beginApplicationInitializationAfterChannelReceipt()
@@ -1054,6 +1361,8 @@ class LabActivity : Activity() {
                     consumeBatteryResponse(responseMetadata)
                     consumePowerModeResponse(responseMetadata)
                     consumeChargeLimitResponse(responseMetadata)
+                    consumeStartingSpeedResponse(responseMetadata)
+                    consumeChargingStatusResponse(responseMetadata)
                     renderCommandState(composer)
                 } else {
                     Log.i(
@@ -1114,10 +1423,24 @@ class LabActivity : Activity() {
                 session?.writeApplicationFrames(chargeLimitFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
+            val startingSpeedFrames = startingSpeedReader?.onApplicationFrame(frame).orEmpty()
+            if (startingSpeedFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(startingSpeedFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
+            val chargingFrames = chargingStatusReader?.onApplicationFrame(frame).orEmpty()
+            if (chargingFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(chargingFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
             renderCommandState(composer)
         } catch (error: Exception) {
             commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
             composer.abort()
+            if (pendingStartingSpeed != null) {
+                startingSpeedValue.text = "Channel error; reconnect to verify starting speed."
+                pendingStartingSpeed = null
+            }
             controlDetail.text = "La conexión no pudo completar la operación."
             setControlsEnabled(true)
             showFailure("No se pudo continuar la operación de aplicación.")
@@ -1125,7 +1448,7 @@ class LabActivity : Activity() {
     }
 
     private fun renderCommandState(composer: MiotScooterCommandComposer) {
-        if (pendingLockState == null && pendingChargeLimit == null) return
+        if (pendingLockState == null && pendingChargeLimit == null && pendingStartingSpeed == null) return
         when (composer.state) {
                 MiotScooterCommandState.COMPLETED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
@@ -1135,6 +1458,14 @@ class LabActivity : Activity() {
                         chargeLimitValue.text = "Acknowledged: $percentage% · verifying…"
                         setControlsEnabled(true)
                         chargeLimitReadHandler.postDelayed(::requestChargeLimit, observedFlowWindowMillis)
+                        return
+                    }
+                    pendingStartingSpeed?.let { speed ->
+                        pendingStartingSpeed = null
+                        pendingStartingVerification = speed
+                        startingSpeedValue.text = "Acknowledged $speed km/h; reading back…"
+                        setControlsEnabled(true)
+                        startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
                         return
                     }
                     pendingLockState?.let { locked ->
@@ -1153,7 +1484,13 @@ class LabActivity : Activity() {
                 MiotScooterCommandState.FAILED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
                     if (pendingChargeLimit != null) chargeLimitValue.text = "Charge limit not confirmed; reconnect to refresh"
+                    pendingStartingSpeed?.let { speed ->
+                        pendingStartingVerification = speed
+                        startingSpeedValue.text = "Write rejected or unconfirmed; reading back…"
+                        startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
+                    }
                     pendingChargeLimit = null
+                    pendingStartingSpeed = null
                     pendingLockState = null
                     controlDetail.text = "El canal rechazó la orden o recibió una respuesta inválida."
                     setControlsEnabled(true)
@@ -1191,6 +1528,24 @@ class LabActivity : Activity() {
         if (::chargeLimitButton.isInitialized) chargeLimitButton.isEnabled = enabled &&
             applicationChannel?.state == ScooterApplicationChannelState.READY &&
             lastKnownChargeLimit != null && pendingChargeVerification == null
+        if (::startingSpeedButton.isInitialized) startingSpeedButton.isEnabled = enabled &&
+            applicationChannel?.state == ScooterApplicationChannelState.READY &&
+            pendingStartingVerification == null &&
+            startingSpeedReader?.state !in setOf(MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK,
+                MiotScooterStartingSpeedReader.State.WAITING_RESPONSE)
+    }
+
+    private fun chargingStatusReadInProgress(): Boolean = chargingStatusReader?.state in setOf(
+        MiotScooterChargingStatusReader.State.WAITING_FLOW_ACK,
+        MiotScooterChargingStatusReader.State.WAITING_RESPONSE,
+    )
+
+    private fun restoreControlsAfterChargingRead() {
+        if (pendingLockState != null || pendingChargeLimit != null || pendingStartingSpeed != null ||
+            commandComposer?.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
+        ) return
+        setControlsEnabled(true)
     }
 
     private fun updateLockToggleLabel() {
@@ -1447,6 +1802,9 @@ class LabActivity : Activity() {
         const val secretSize = 32
         const val commandTimeoutMillis = 8_000L
         const val batteryReadTimeoutMillis = 3_000L
+        const val chargingPollIntervalMillis = 10_000L
+        const val chargingBusyRetryMillis = 1_000L
+        const val chargingStatusStaleMillis = 20_000L
         const val applicationStartupFinalSettleMillis = 300L
         // Xiaomi Home's first data frame follows the application flow by roughly 80 ms. The
         // The GATT writer schedules the flow about 20 ms after it is queued.

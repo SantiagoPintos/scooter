@@ -47,6 +47,110 @@ class MiotBleSpecV2CodecTest {
     }
 
     @Test
+    fun startingSpeedProbeUsesPropertyFourTwelveAndRejectsOtherValues() {
+        for (speed in listOf(3, 4, 5)) {
+            val fields = ByteBuffer.wrap(MiotBleSpecV2Codec.setScooterStartingSpeed(2, speed))
+                .order(ByteOrder.LITTLE_ENDIAN)
+            fields.position(6)
+            assertEquals(4, fields.get().toInt() and 0xff)
+            assertEquals(12, fields.short.toInt() and 0xffff)
+            assertEquals(0x1001, fields.short.toInt() and 0xffff)
+            assertEquals(speed, fields.get().toInt() and 0xff)
+        }
+        for (speed in listOf(-1, 0, 1, 2, 6)) {
+            try {
+                MiotBleSpecV2Codec.setScooterStartingSpeed(2, speed)
+                throw AssertionError("Expected invalid starting speed to be rejected")
+            } catch (_: IllegalArgumentException) { /* Expected. */ }
+        }
+    }
+
+    @Test
+    fun startingSpeedReadAcceptsZeroOnlyForMatchingAuthenticatedProperty() {
+        val key = ByteArray(64) { (it + 41).toByte() }
+        val reader = MiotScooterStartingSpeedReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(key))
+        reader.begin()
+        reader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(14, 14, 2, 3, 1, 4, 21, 0, startingSpeedValue = 0)))
+        assertEquals(0, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(14, 14, 2, 3, 1, 4, 12, 0, startingSpeedValue = 0)))
+        assertEquals(MiotScooterStartingSpeedReader.State.COMPLETED, reader.state)
+        val writer = MiotScooterCommandComposer(key)
+        writer.beginStartingSpeed(3)
+        writer.advanceWithoutFlowAcknowledgement()
+        assertEquals(false, writer.onInboundResponse(MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 4, 21, 0)))
+        assertEquals(true, writer.onInboundResponse(MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 4, 12, 0)))
+    }
+
+    @Test
+    fun startingSpeedResponseExtractionRejectsUnsupportedValue() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readValue(value: Int): Int? {
+            val plaintext = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or 14).toShort()).putShort(2).put(3).put(1).put(4)
+                .putShort(12).putShort(0).putShort(0).put(value.toByte()).array()
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext))?.startingSpeedValue
+        }
+        assertEquals(0, readValue(0))
+        assertEquals(3, readValue(3))
+        assertEquals(null, readValue(2))
+    }
+
+    @Test
+    fun chargingStatusAcceptsMatchingReadAndUnsolicitedNotification() {
+        val reader = MiotScooterChargingStatusReader(
+            MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64) { (it + 41).toByte() }),
+        )
+        reader.begin()
+        reader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(14, 14, 99, 3, 1, 3, 2, 0, chargingStatusValue = 1)))
+        assertEquals(3, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(12, 12, 99, 4, 1, 3, 2, 0x1001, chargingStatusValue = 3)))
+        assertEquals(MiotScooterChargingStatusReader.State.WAITING_RESPONSE, reader.state)
+        assertEquals(1, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(14, 14, 2, 3, 1, 3, 2, 0, chargingStatusValue = 1)))
+        assertEquals(MiotScooterChargingStatusReader.State.COMPLETED, reader.state)
+    }
+
+    @Test
+    fun chargingIndicatorAppearsOnlyForChargingStates() {
+        for (value in listOf(null, 0, 2, 4)) {
+            assertEquals(false, MiotScooterChargingStatusReader.isCharging(value))
+        }
+        for (value in listOf(1, 3)) {
+            assertEquals(true, MiotScooterChargingStatusReader.isCharging(value))
+        }
+    }
+
+    @Test
+    fun chargingStatusExtractorRequiresKnownCodeAndResponseShape() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readValue(operation: Int, prefix: Int, value: Int): Int? {
+            val length = if (operation == 4) 12 else 14
+            val plaintext = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or length).toShort()).putShort(2).put(operation.toByte())
+                .put(1).put(3).putShort(2).putShort(prefix.toShort())
+            if (length == 14) plaintext.putShort(0)
+            plaintext.put(value.toByte())
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext.array()))?.chargingStatusValue
+        }
+        assertEquals(1, readValue(3, 0, 1))
+        assertEquals(3, readValue(4, 0x1001, 3))
+        assertEquals(null, readValue(4, 0x1001, 5))
+        assertEquals(null, readValue(4, 0, 1))
+    }
+
+    @Test
     fun chargeLimitReaderAcceptsOnlyMatchingSupportedResponse() {
         val reader = MiotScooterChargeLimitReader(
             MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64) { (it + 41).toByte() }),

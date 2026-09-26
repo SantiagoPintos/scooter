@@ -80,6 +80,18 @@ object MiotBleSpecV2Codec {
 
     private const val scooterChargeLimitPiid = 21
 
+    /** Writes only Xiaomi's published 3–5 km/h starting-speed range. */
+    fun setScooterStartingSpeed(requestId: Int, speedKmh: Int): ByteArray {
+        require(speedKmh in 3..5)
+        return header(requestId, 12)
+            .put(setPropertyOpcode.toByte()).put(1).put(scooterControlSiid.toByte())
+            .putShort(scooterStartingSpeedPiid.toShort())
+            .putShort(((uint8ValueType shl 12) or uint8ValueLength).toShort())
+            .put(speedKmh.toByte()).array()
+    }
+
+    private const val scooterStartingSpeedPiid = 12
+
     private fun header(requestId: Int, length: Int): ByteBuffer {
         require(requestId in 1..0xffff) { "MiOT request id must be a nonzero unsigned short" }
         return ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
@@ -475,6 +487,15 @@ class MiotScooterCommandComposer private constructor(
             MiotBleSpecV2Codec.setScooterChargeLimit(requestId, percentage))
     }
 
+    fun beginStartingSpeed(speedKmh: Int): List<ByteArray> {
+        check(state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED || state == MiotScooterCommandState.FAILED) {
+            "An application command is already in progress"
+        }
+        val requestId = requestIds.next()
+        return beginPropertyWrite(requestId, startingSpeedServiceId, startingSpeedPropertyId,
+            MiotBleSpecV2Codec.setScooterStartingSpeed(requestId, speedKmh))
+    }
+
     private fun beginPropertyWrite(
         requestId: Int,
         serviceId: Int,
@@ -591,6 +612,8 @@ class MiotScooterCommandComposer private constructor(
         const val lockPropertyId = 6
         const val chargeLimitServiceId = 4
         const val chargeLimitPropertyId = 21
+        const val startingSpeedServiceId = 4
+        const val startingSpeedPropertyId = 12
     }
 }
 
@@ -733,6 +756,8 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
             powerModeValue = extractPowerModeValue(plaintext, serviceId, propertyId),
             batteryPercentValue = extractBatteryPercentage(plaintext, serviceId, propertyId),
             chargeLimitValue = extractChargeLimitValue(plaintext, serviceId, propertyId),
+            startingSpeedValue = extractStartingSpeedValue(plaintext, serviceId, propertyId),
+            chargingStatusValue = extractChargingStatusValue(plaintext, serviceId, propertyId),
         )
         plaintext.fill(0)
         metadata
@@ -757,7 +782,33 @@ data class MiotInboundPayloadMetadata(
     val powerModeValue: Int? = null,
     val batteryPercentValue: Int? = null,
     val chargeLimitValue: Int? = null,
+    val startingSpeedValue: Int? = null,
+    val chargingStatusValue: Int? = null,
 )
+
+/** Extracts a documented charge-state code from a get response or a property notification. */
+private fun extractChargingStatusValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
+    if (serviceId != MiotScooterChargingStatusReader.serviceId ||
+        propertyId != MiotScooterChargingStatusReader.propertyId ||
+        plaintext.size < 12 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size ||
+        (plaintext[5].toInt() and 0xff) != 1
+    ) return null
+    val validShape = when (plaintext[4].toInt() and 0xff) {
+        1, 3 -> plaintext.size == 14 && readLittleEndianShort(plaintext, 9) == 0
+        4 -> plaintext.size == 12 && readLittleEndianShort(plaintext, 9) == 0x1001
+        else -> false
+    }
+    return if (validShape) (plaintext.last().toInt() and 0xff).takeIf { it in 0..4 } else null
+}
+
+private fun extractStartingSpeedValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
+    if (serviceId != MiotScooterStartingSpeedReader.serviceId ||
+        propertyId != MiotScooterStartingSpeedReader.propertyId ||
+        plaintext.size != 14 || readLittleEndianShort(plaintext, 9) != 0
+    ) return null
+    return (plaintext.last().toInt() and 0xff).takeIf { it == 0 || it in 3..5 }
+}
 
 private fun extractChargeLimitValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
     if (serviceId != MiotScooterChargeLimitReader.serviceId ||
