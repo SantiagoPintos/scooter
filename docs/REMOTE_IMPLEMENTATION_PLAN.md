@@ -85,6 +85,12 @@ No physical MiOT command is permitted in this milestone.
 
 **Gate:** repeated connect/disconnect sessions with only structural diagnostic metadata.
 
+**Port status:** The explicit-target Zephyr central path now compiles through scanning,
+connection, MTU exchange, FE95 characteristic discovery, authentication notification
+subscription, and capability read. No target provisioning caller or hardware verification is
+present, so the gate is not yet met. The status and application-channel subscriptions remain
+for the next transport increment, after the A4/A5 exchange is wired in.
+
 ### 3. Port authentication and application initialization
 
 Port A4/A5 bootstrap, channel framing/ACK handling, fresh P-256 ECDH, HKDF-SHA256, AES-CCM,

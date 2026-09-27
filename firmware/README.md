@@ -1,9 +1,9 @@
 # XIAO nRF52840 remote firmware
 
-The Zephyr application targets `xiao_ble/nrf52840`. It currently exercises the onboard LED
-and compiles portable authentication-channel framing and A4/A5 bootstrap code. The protocol
-modules do not contain a scooter identity, credential, BLE transport, or physical command.
-The LED loop is a bring-up aid, not a battery-life design.
+The Zephyr application targets `xiao_ble/nrf52840`. It initializes Bluetooth and exercises
+the onboard LED, but does not scan or connect automatically. The protocol modules contain no
+scooter identity, credential, or physical command. The LED loop is a bring-up aid, not a
+battery-life design.
 
 ## Build
 
@@ -28,5 +28,14 @@ Android I/O. `tests/scooter_channel_test.c` uses synthetic frames to check encod
 validation, and buffer boundaries. The C tests are intended to run with any standard C11
 compiler; they do not require BLE or scooter access.
 
-No authenticated session or scooter operation is implemented yet. The remaining acceptance
-gates are in the [remote implementation plan](../docs/REMOTE_IMPLEMENTATION_PLAN.md).
+`src/scooter_transport.c` begins the BLE central port. An application thread can explicitly
+call `scooter_transport_open()` with a provisioned BLE address. It scans only for that address,
+connects, negotiates an ATT MTU of at least 247, discovers FE95 and the five required
+characteristics, subscribes to authentication characteristic `0016`, and reads capability
+characteristic `0004` without retaining its value. `scooter_transport_close()` disconnects.
+Every phase has a timeout, and no address or payload is logged. This path is compile-verified
+but still needs a hardware connection test; no target provisioning caller exists yet.
+
+The transport does not yet send the A4/A5 bootstrap or initialize the authenticated MiOT
+session. The remaining acceptance gates are in the
+[remote implementation plan](../docs/REMOTE_IMPLEMENTATION_PLAN.md).

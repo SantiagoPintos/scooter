@@ -1,11 +1,13 @@
 /*
- * First board bring-up image. No radio, credential, or scooter command is present.
+ * Bring-up image: Bluetooth initializes, but no target scan or scooter command starts on boot.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
+
+#include "scooter_transport.h"
 
 #define STATUS_LED_NODE DT_ALIAS(led0)
 
@@ -22,6 +24,9 @@ int main(void)
 	}
 
 	if (gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE) != 0) {
+		return 1;
+	}
+	if (scooter_transport_init() != 0) {
 		return 1;
 	}
 
