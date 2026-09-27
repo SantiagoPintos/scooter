@@ -52,6 +52,15 @@ fully standalone remote. Document the observed result without retaining payloads
 
 **Gate:** a tested startup-time rule and an offline time strategy, or an explicit blocker.
 
+**Read-only result, 2026-09-26:** A temporary Android diagnostic build omitted only the
+fourth MiOT startup message (the clock update), disabled all physical controls, and requested
+only battery percentage. On the test scooter it completed authentication and MiOT application
+initialization, then received a matching authenticated battery response. The temporary code
+was removed after the test. Therefore a wall clock is **not required for this initialization
+and read-only query**. The firmware can first try the three-message startup path with no RTC.
+Whether a lock/unlock write is also accepted without the clock update remains untested and
+belongs to the supervised physical-action gate in Milestone 4; do not infer it from the read.
+
 ### 1. Bring up board, power, and input
 
 Build and flash a minimal Zephyr image via the board's UF2 bootloader. Verify both buttons,
@@ -60,6 +69,11 @@ with the actual 200 mAh cell; do not estimate runtime from the board's marketing
 number. Keep the buzzer disconnected at this stage.
 
 **Gate:** button wake, unambiguous status feedback, repeatable flashing, and measured current.
+
+**Implementation status:** The `xiao_ble/nrf52840` application compiles with Zephyr `v4.4.0`
+and SDK `1.0.1` and produces a Git-ignored UF2 image. Its authentication-channel framing and
+A4/A5 bootstrap are portable C modules with synthetic compatibility tests. Flashing, button
+wake, USB recovery, and power measurements remain hardware acceptance checks.
 
 ### 2. BLE transport without scooter control
 
@@ -74,8 +88,10 @@ No physical MiOT command is permitted in this milestone.
 ### 3. Port authentication and application initialization
 
 Port A4/A5 bootstrap, channel framing/ACK handling, fresh P-256 ECDH, HKDF-SHA256, AES-CCM,
-directional nonce/counter rules, security-chip confirmation, and the observed four-message
-MiOT startup sequence. Provision the **effective** test credential and target identity over
+directional nonce/counter rules, security-chip confirmation, and the three-message MiOT startup
+path proven for a read-only query. Keep the fourth, clock-setting message documented as an
+optional compatibility path until a supervised lock/unlock test resolves its necessity.
+Provision the **effective** test credential and target identity over
 USB into device-local storage; neither is compiled into a binary. For this lab, a simple
 device-local storage implementation is acceptable, but clearly mark it non-production.
 Compare the firmware's cryptography and framing to Android using synthetic vectors. Do not

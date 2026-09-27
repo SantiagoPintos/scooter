@@ -11,11 +11,14 @@ user-confirmed lock and unlock actions.
 - `scooterlab/`: Kotlin protocol library. Keep cryptography, counters, and framing independent
   from UI and Android I/O whenever possible.
 - `scooterlabapp/`: Android application, dashboard UI, and GATT transport adapter.
+- `firmware/`: XIAO nRF52840 Zephyr application and portable protocol modules. Do not add
+  scooter actions before transport, crypto, and confirmation gates are verified.
 - `docs/`: research notes that contain no secret material. Update them only when a conclusion is
   confirmed.
 - `scooterlab/tools/`: local instrumentation utilities. It is Git-ignored because tools can
   require a test phone, Frida, or private captures.
 - `scooterlab/local/`: local credential backup. It is Git-ignored.
+- `firmware/local/`: local Zephyr toolchain and future provisioning material. It is Git-ignored.
 
 ## Confirmed State
 
@@ -43,10 +46,10 @@ user-confirmed lock and unlock actions.
 - Add unit tests when changing codecs, counters, framing, or confirmation rules.
 - Before handing off Android changes, run `:scooterlab:testDebugUnitTest` and assemble
   `:scooterlabapp:assembleDebug`.
-- Build and install debug APKs from the same Windows user profile. Android accepts an in-place
+- Build and install debug APKs with the same signing identity. Android accepts an in-place
   update only when the APK has the same signing certificate as the installed package. Do not
-  delete or regenerate `%USERPROFILE%\.android\debug.keystore`, and do not use a sandboxed or
-  alternate home directory for a release intended to update the test phone.
+  delete or regenerate the debug keystore, and avoid using an alternate environment for an
+  APK intended to update the test phone.
 - If Android reports `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, stop before uninstalling. First locate
   the signing key used by the installed build. If a reinstall is necessary, verify that
   `scooterlab/local/lab_credential.bin` exists and is 32 bytes before removing the app; restoring
@@ -58,7 +61,13 @@ user-confirmed lock and unlock actions.
 
 ## Next Phase
 
-Replicate additional Xiaomi Home features one at a time: establish the semantic operation from
-code and observed behavior, implement the smallest protocol path, add tests, then verify it with
-a supervised manual scooter test. The dashboard may reserve visual space for unimplemented data,
-but it must never claim that unavailable telemetry is real.
+Port the proven BLE protocol to the XIAO nRF52840 in the gates described by
+`docs/REMOTE_IMPLEMENTATION_PLAN.md`. The temporary Android clock-omission probe confirmed
+authenticated MiOT initialization and a battery read without the clock update; it did not
+test a physical write. The Android client remains the verified behavior reference, not firmware
+source to copy wholesale. Firmware protocol modules must use synthetic test data and keep
+credentials and scooter commands out of bring-up images until the relevant gates pass.
+
+For further Xiaomi Home features, establish semantics from code and observed behavior, implement
+the smallest protocol path, add tests, then verify with a supervised manual scooter test. The
+dashboard may reserve space for unimplemented data but must never claim it is real telemetry.

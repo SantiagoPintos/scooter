@@ -28,11 +28,11 @@ UI, and is excluded from Git.
 
 Android treats the application ID and signing certificate as the identity of an installed app.
 An APK can update the test phone only when it is signed by the same key as the installed version.
-For the normal debug workflow, that key is the Android debug keystore in the current Windows
-user profile, usually `%USERPROFILE%\.android\debug.keystore`.
+For the normal debug workflow, that key is the Android debug keystore in the active user's
+home directory.
 
-- Build and install from the same Windows profile and prefer Android Studio or the repository's
-  `gradlew.bat` from that profile.
+- Build and install under the same user identity and prefer Android Studio or the repository's
+  Gradle wrapper.
 - Do not delete, regenerate, copy, or replace the debug keystore while this test installation is
   still needed.
 - Avoid building an APK intended for the phone from a sandbox, service account, or alternate home
@@ -64,7 +64,7 @@ install is unavoidable:
 
 Example, replacing `<serial>` with the selected physical device:
 
-```powershell
+```text
 adb -s <serial> push scooterlab/local/lab_credential.bin /data/local/tmp/scooterlab_lab_credential.bin
 adb -s <serial> shell "run-as com.velocimetro.scooterlabapp cp /data/local/tmp/scooterlab_lab_credential.bin files/lab_credential.bin"
 adb -s <serial> shell rm -f /data/local/tmp/scooterlab_lab_credential.bin

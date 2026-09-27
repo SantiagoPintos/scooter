@@ -19,6 +19,7 @@ The charge-limit property, read/write flow, and current verification status are 
 
 The standalone XIAO nRF52840 key-fob roadmap is in
 [Remote implementation plan](docs/REMOTE_IMPLEMENTATION_PLAN.md).
+The board bring-up firmware is in [firmware/](firmware/README.md).
 
 ## Development
 
@@ -27,11 +28,8 @@ The standalone XIAO nRF52840 key-fob roadmap is in
 3. Provision the local test credential. Never add it to the repository.
 4. Run `:scooterlabapp`.
 
-Build the app and run the protocol tests with:
-
-```powershell
-.\gradlew.bat :scooterlab:testDebugUnitTest :scooterlabapp:assembleDebug
-```
+Use the Gradle wrapper to run `:scooterlab:testDebugUnitTest` and
+`:scooterlabapp:assembleDebug`.
 
 For debug signing, credential backup, safe reinstall, and troubleshooting notes, see
 [Scooter Control](scooterlabapp/README.md#development-and-reinstall-notes).
