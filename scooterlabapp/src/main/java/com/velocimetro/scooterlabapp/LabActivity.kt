@@ -24,6 +24,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import com.velocimetro.scooterlab.MiotBleApplicationCipher
 import com.velocimetro.scooterlab.MiotBleSpecV2Codec
 import com.velocimetro.scooterlab.MiotBleSpecRequestCounter
@@ -34,7 +35,9 @@ import com.velocimetro.scooterlab.MiotScooterPowerModeReader
 import com.velocimetro.scooterlab.MiotScooterPowerModeReadState
 import com.velocimetro.scooterlab.MiotScooterChargeLimitReader
 import com.velocimetro.scooterlab.MiotScooterStartingSpeedReader
+import com.velocimetro.scooterlab.MiotScooterDriveSpeedLimitReader
 import com.velocimetro.scooterlab.MiotScooterChargingStatusReader
+import com.velocimetro.scooterlab.MiotScooterLockStateReader
 import com.velocimetro.scooterlab.MiotScooterInboundResponseConsumer
 import com.velocimetro.scooterlab.MiotScooterInitializationState
 import com.velocimetro.scooterlab.ScooterApplicationChannel
@@ -48,7 +51,8 @@ import java.util.TimeZone
 /**
  * Debug-only launcher for a Bluetooth authentication check and explicit laboratory lock tests.
  * A physical action is possible only after the scooter accepts a fresh session, the response
- * channel is ready, and the user confirms a specific on-screen action. The target is chosen
+ * channel is ready, and the user explicitly requests an action (unlocking also requires
+ * confirmation). The target is chosen
  * locally and the laboratory credential is provisioned once by the lab runner.
  */
 class LabActivity : Activity() {
@@ -64,25 +68,32 @@ class LabActivity : Activity() {
     private lateinit var candidateList: LinearLayout
     private lateinit var controlsCard: LinearLayout
     private lateinit var controlDetail: TextView
-    private lateinit var lockToggleButton: Button
+    private lateinit var lockToggleButton: TextView
     private lateinit var chargeLimitValue: TextView
     private lateinit var chargeLimitButton: Button
     private lateinit var startingSpeedValue: TextView
     private lateinit var startingSpeedButton: Button
+    private lateinit var driveSpeedLimitValue: TextView
+    private lateinit var driveSpeedLimitButton: Button
     private lateinit var dashboardContent: LinearLayout
     private lateinit var settingsContent: LinearLayout
     private lateinit var dashboardTabButton: Button
     private lateinit var settingsTabButton: Button
     private lateinit var scooterNameValue: TextView
     private lateinit var batteryValue: TextView
+    private lateinit var modeValue: TextView
+    private lateinit var connectionValue: TextView
+    private lateinit var rangeValue: TextView
     private lateinit var chargingStatusValue: TextView
     private lateinit var setupButton: Button
     private var session: ScooterSessionConnection? = null
     private var commandComposer: MiotScooterCommandComposer? = null
     private var batteryReader: MiotScooterBatteryReader? = null
+    private var lockStateReader: MiotScooterLockStateReader? = null
     private var powerModeReader: MiotScooterPowerModeReader? = null
     private var chargeLimitReader: MiotScooterChargeLimitReader? = null
     private var startingSpeedReader: MiotScooterStartingSpeedReader? = null
+    private var driveSpeedLimitReader: MiotScooterDriveSpeedLimitReader? = null
     private var chargingStatusReader: MiotScooterChargingStatusReader? = null
     private var applicationInitializer: MiotScooterApplicationInitializer? = null
     private var inboundResponseConsumer: MiotScooterInboundResponseConsumer? = null
@@ -97,6 +108,9 @@ class LabActivity : Activity() {
     private var pendingStartingSpeed: Int? = null
     private var pendingStartingVerification: Int? = null
     private var lastKnownStartingSpeed: Int? = null
+    private var pendingDriveSpeedLimit: Int? = null
+    private var pendingDriveSpeedVerification: Int? = null
+    private var lastKnownDriveSpeedLimit: Int? = null
     private var lastKnownLockState: Boolean? = null
     private var lastKnownBatteryPercentage: Int? = null
     private var lastKnownPowerMode: Int? = null
@@ -110,9 +124,11 @@ class LabActivity : Activity() {
     private val commandTimeoutHandler = Handler(Looper.getMainLooper())
     private val applicationInitializationHandler = Handler(Looper.getMainLooper())
     private val batteryReadHandler = Handler(Looper.getMainLooper())
+    private val lockStateReadHandler = Handler(Looper.getMainLooper())
     private val powerModeReadHandler = Handler(Looper.getMainLooper())
     private val chargeLimitReadHandler = Handler(Looper.getMainLooper())
     private val startingSpeedReadHandler = Handler(Looper.getMainLooper())
+    private val driveSpeedReadHandler = Handler(Looper.getMainLooper())
     private val chargingReadHandler = Handler(Looper.getMainLooper())
     private val chargingPollRunnable = Runnable { requestChargingStatus() }
     private val automaticConnectionHandler = Handler(Looper.getMainLooper())
@@ -124,6 +140,20 @@ class LabActivity : Activity() {
             reader.cancel()
             Log.i(logTag, "Battery read did not return a matching MiOT response; leaving dashboard value unavailable.")
             requestPowerMode()
+        }
+    }
+    private val lockStateReadTimeoutRunnable = Runnable {
+        val reader = lockStateReader ?: return@Runnable
+        if (reader.state == MiotScooterLockStateReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterLockStateReader.State.WAITING_RESPONSE
+        ) {
+            reader.cancel()
+            lastKnownLockState = null
+            updateLockToggleLabel()
+            controlDetail.text = "No se pudo leer el estado del candado. Reconectá para volver a intentarlo."
+            Log.i(logTag, "Lock-state read did not return a matching MiOT response; lock control remains disabled.")
+            setControlsEnabled(true)
+            requestBatteryPercentage()
         }
     }
     private val powerModeReadTimeoutRunnable = Runnable {
@@ -160,6 +190,18 @@ class LabActivity : Activity() {
         pendingStartingVerification = null
         lastKnownStartingSpeed = null
         restoreControlsAfterChargingRead()
+        requestDriveSpeedLimit()
+    }
+    private val driveSpeedReadTimeoutRunnable = Runnable {
+        driveSpeedLimitReader?.cancel()
+        driveSpeedLimitValue.text = if (pendingDriveSpeedVerification != null) {
+            "Drive limit not verified; reconnect to refresh."
+        } else {
+            "Drive limit unavailable"
+        }
+        pendingDriveSpeedVerification = null
+        lastKnownDriveSpeedLimit = null
+        restoreControlsAfterChargingRead()
         scheduleChargingStatusRead()
     }
     private val chargingReadTimeoutRunnable = Runnable {
@@ -178,11 +220,13 @@ class LabActivity : Activity() {
             composer.state == MiotScooterCommandState.WAITING_RESPONSE
         ) {
             val startingSpeedAttempt = pendingStartingSpeed
+            val driveSpeedAttempt = pendingDriveSpeedLimit
             val chargeLimitAttempt = pendingChargeLimit
             composer.abort()
             pendingLockState = null
             pendingChargeLimit = null
             pendingStartingSpeed = null
+            pendingDriveSpeedLimit = null
             if (chargeLimitAttempt != null) chargeLimitValue.text =
                 "Charge limit not confirmed; refresh before retrying"
             if (startingSpeedAttempt != null) {
@@ -190,8 +234,14 @@ class LabActivity : Activity() {
                 startingSpeedValue.text = "No write confirmation; reading back…"
                 startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
             }
+            if (driveSpeedAttempt != null) {
+                pendingDriveSpeedVerification = driveSpeedAttempt
+                driveSpeedLimitValue.text = "No write confirmation; reading back…"
+                driveSpeedReadHandler.postDelayed(::requestDriveSpeedLimit, observedFlowWindowMillis)
+            }
             controlDetail.text = "El scooter no confirmó la orden dentro del tiempo esperado."
-            setControlsEnabled(applicationChannel?.state == ScooterApplicationChannelState.READY)
+            setControlsEnabled(driveSpeedAttempt == null &&
+                applicationChannel?.state == ScooterApplicationChannelState.READY)
             showFailure("The scooter did not confirm the setting. Check its current state before retrying.")
         }
     }
@@ -237,22 +287,28 @@ class LabActivity : Activity() {
         commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
         applicationInitializationHandler.removeCallbacksAndMessages(null)
         batteryReadHandler.removeCallbacksAndMessages(null)
+        lockStateReadHandler.removeCallbacksAndMessages(null)
         powerModeReadHandler.removeCallbacksAndMessages(null)
         chargeLimitReadHandler.removeCallbacksAndMessages(null)
         startingSpeedReadHandler.removeCallbacksAndMessages(null)
+        driveSpeedReadHandler.removeCallbacksAndMessages(null)
         chargingReadHandler.removeCallbacksAndMessages(null)
         automaticConnectionHandler.removeCallbacksAndMessages(null)
         commandComposer?.clear()
         batteryReader?.cancel()
+        lockStateReader?.cancel()
         powerModeReader?.cancel()
         chargeLimitReader?.cancel()
         startingSpeedReader?.cancel()
+        driveSpeedLimitReader?.cancel()
         chargingStatusReader?.cancel()
         applicationInitializer = null
         batteryReader = null
+        lockStateReader = null
         powerModeReader = null
         chargeLimitReader = null
         startingSpeedReader = null
+        driveSpeedLimitReader = null
         chargingStatusReader = null
         inboundResponseConsumer = null
         applicationChannel?.clear()
@@ -262,141 +318,253 @@ class LabActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun createContent(): View = ScrollView(this).apply {
+    private fun createContent(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
         setBackgroundColor(backgroundColor)
-        isFillViewport = true
-        addView(LinearLayout(this@LabActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(24), dp(20), dp(28))
+        addView(ScrollView(this@LabActivity).apply {
+            isFillViewport = true
+            addView(LinearLayout(this@LabActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20), dp(24), dp(20), dp(24))
 
-            addView(heroCard())
-            addView(spacer(18))
-            dashboardContent = LinearLayout(this@LabActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(scooterOverviewCard())
-                addView(spacer(14))
-                addView(statusCard())
-                controlsCard = controlCard()
-                addView(controlsCard)
-            }
-            addView(dashboardContent)
-            settingsContent = LinearLayout(this@LabActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                visibility = View.GONE
-                addView(readinessCard())
-                addView(spacer(16))
-                addView(chargeLimitCard())
-                addView(spacer(16))
-                addView(startingSpeedCard())
-                addView(spacer(16))
-                startButton = Button(this@LabActivity).apply {
-                    text = "Reconnect scooter"
-                    textSize = 16f
-                    isAllCaps = false
-                    setTextColor(Color.WHITE)
-                    typeface = Typeface.DEFAULT_BOLD
-                    setBackgroundDrawable(roundBackground(primaryActionColor, 16))
-                    setOnClickListener { startAuthentication() }
+                dashboardContent = LinearLayout(this@LabActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(heroCard())
+                    addView(spacer(18))
+                    addView(scooterOverviewCard())
+                    addView(spacer(16))
+                    controlsCard = controlCard()
+                    addView(controlsCard)
                 }
-                addView(startButton, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    dp(52),
-                ))
-            }
-            addView(settingsContent)
-            addView(spacer(18))
-            addView(bottomNavigation())
+                addView(dashboardContent)
+                settingsContent = LinearLayout(this@LabActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    visibility = View.GONE
+                    addView(readinessCard())
+                    addView(spacer(16))
+                    addView(statusCard())
+                    addView(spacer(16))
+                    addView(chargeLimitCard())
+                    addView(spacer(16))
+                    addView(startingSpeedCard())
+                    addView(spacer(16))
+                    addView(driveSpeedLimitCard())
+                    addView(spacer(16))
+                    startButton = Button(this@LabActivity).apply {
+                        text = "Reconnect scooter"
+                        textSize = 16f
+                        isAllCaps = false
+                        setTextColor(Color.WHITE)
+                        typeface = Typeface.DEFAULT_BOLD
+                        setBackgroundDrawable(roundBackground(primaryActionColor, 16))
+                        setOnClickListener { startAuthentication() }
+                    }
+                    addView(startButton, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(52),
+                    ))
+                }
+                addView(settingsContent)
+            })
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f,
+        ))
+        addView(bottomNavigation(), LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            leftMargin = dp(14)
+            rightMargin = dp(14)
+            topMargin = dp(4)
+            bottomMargin = dp(8)
         })
     }
 
     private fun heroCard(): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(22), dp(20), dp(22), dp(20))
-        setBackgroundDrawable(roundBackground(heroCardColor, 24))
-        elevation = dp(6).toFloat()
+        setPadding(dp(2), dp(8), dp(2), dp(4))
         addView(TextView(this@LabActivity).apply {
-            text = "YOUR SCOOTER"
-            setTextColor(accentColor)
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.12f
-        })
-        addView(TextView(this@LabActivity).apply {
-            text = "Xiaomi Scooter 6 Max   •   Bluetooth"
+            text = "Hola"
             setTextColor(primaryTextColor)
-            textSize = 25f
+            textSize = 30f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(8), 0, 0)
         })
-        addView(TextView(this@LabActivity).apply {
-            text = "Direct control from this phone"
-            setTextColor(secondaryTextColor)
-            textSize = 15f
-            setPadding(0, dp(5), 0, 0)
+        addView(LinearLayout(this@LabActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(16), 0, 0)
+            addView(TextView(this@LabActivity).apply {
+                text = "●"
+                setTextColor(mutedTextColor)
+                textSize = 13f
+                setPadding(0, 0, dp(8), 0)
+            })
+            connectionValue = TextView(this@LabActivity).apply {
+                text = "Desconectado"
+                setTextColor(secondaryTextColor)
+                textSize = 14f
+                includeFontPadding = false
+                gravity = Gravity.CENTER_VERTICAL
+                maxLines = 1
+            }
+            addView(connectionValue)
+            scooterNameValue = TextView(this@LabActivity).apply {
+                text = selectedTargetName()
+                setTextColor(primaryTextColor)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                includeFontPadding = false
+                gravity = Gravity.CENTER_VERTICAL
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(dp(2), 0, 0, 0)
+            }
+            addView(scooterNameValue, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Button(this@LabActivity).apply {
+                text = "⚙"
+                textSize = 19f
+                isAllCaps = false
+                setTextColor(primaryTextColor)
+                setBackgroundDrawable(roundBackground(tileColor, 30))
+                setOnClickListener { showSettings() }
+            }, LinearLayout.LayoutParams(dp(46), dp(46)))
         })
     }
 
     private fun scooterOverviewCard(): View = card().apply {
-        addView(TextView(this@LabActivity).apply {
-            text = "DASHBOARD"
-            setTextColor(mutedTextColor)
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.1f
-        })
-        scooterNameValue = TextView(this@LabActivity).apply {
-            text = "Scooter not selected"
-            setTextColor(primaryTextColor)
-            textSize = 22f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(10), 0, 0)
-        }
-        addView(scooterNameValue)
-        batteryValue = TextView(this@LabActivity).apply {
-            text = "Battery  —"
-            setTextColor(secondaryTextColor)
-            textSize = 17f
-            setPadding(0, dp(6), 0, 0)
-        }
-        addView(batteryValue)
+        setPadding(dp(14), dp(14), dp(14), dp(14))
+        setBackgroundColor(backgroundColor)
+        elevation = 0f
+        val topRow = LinearLayout(this@LabActivity).apply { orientation = LinearLayout.HORIZONTAL }
+        val rangeTile = metricTile("↗", "— km", "Rango estimado")
+        rangeValue = rangeTile.second
+        topRow.addView(rangeTile.first,
+            LinearLayout.LayoutParams(0, dp(112), 1f))
+        topRow.addView(spacer(1).apply { layoutParams = LinearLayout.LayoutParams(dp(12), 1) })
+        val batteryTile = metricTile("ϟ", "—%", "Batería")
+        batteryValue = batteryTile.second
+        topRow.addView(batteryTile.first,
+            LinearLayout.LayoutParams(0, dp(112), 1f))
+        addView(topRow)
+        addView(spacer(12))
+        val bottomRow = LinearLayout(this@LabActivity).apply { orientation = LinearLayout.HORIZONTAL }
+        val modeTile = metricTile("◉", "—", "Modo")
+        modeValue = modeTile.second
+        bottomRow.addView(modeTile.first,
+            LinearLayout.LayoutParams(0, dp(112), 1f))
+        bottomRow.addView(spacer(1).apply { layoutParams = LinearLayout.LayoutParams(dp(12), 1) })
+        bottomRow.addView(lockControlTile(),
+            LinearLayout.LayoutParams(0, dp(112), 1f))
+        addView(bottomRow)
         chargingStatusValue = TextView(this@LabActivity).apply {
             text = "Cargando"
-            setTextColor(secondaryTextColor)
-            textSize = 15f
-            setPadding(0, dp(6), 0, 0)
+            setTextColor(accentColor)
+            textSize = 13f
+            setPadding(dp(4), dp(6), 0, 0)
             visibility = View.GONE
         }
         addView(chargingStatusValue)
         setupButton = Button(this@LabActivity).apply {
-            text = "Choose scooter in Settings"
+            text = "Configurar scooter"
             isAllCaps = false
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(primaryTextColor)
             setBackgroundDrawable(roundBackground(secondaryActionColor, 14))
             setOnClickListener { showSettings() }
         }
-        addView(setupButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(48),
-        ).apply { topMargin = dp(16) })
+        addView(setupButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
+            topMargin = dp(12)
+        })
+    }
+
+    private fun metricTile(icon: String, value: String, label: String): Pair<LinearLayout, TextView> {
+        val valueView = TextView(this).apply {
+            text = value
+            setTextColor(primaryTextColor)
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val tile = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(12), dp(12))
+            setBackgroundDrawable(roundBackground(tileColor, 24))
+            addView(TextView(this@LabActivity).apply {
+                text = icon
+                setTextColor(accentColor)
+                textSize = 17f
+            })
+            addView(valueView)
+            addView(TextView(this@LabActivity).apply {
+                text = label
+                setTextColor(secondaryTextColor)
+                textSize = 12f
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
+        return tile to valueView
+    }
+
+    private fun lockControlTile(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(16), dp(12), dp(12), dp(12))
+        setBackgroundDrawable(roundBackground(tileColor, 24))
+        addView(TextView(this@LabActivity).apply {
+            text = "◉"
+            setTextColor(accentColor)
+            textSize = 17f
+            includeFontPadding = false
+        })
+        lockToggleButton = TextView(this@LabActivity).apply {
+            text = "Bloqueo"
+            isEnabled = false
+            textSize = 16f
+            gravity = Gravity.CENTER_VERTICAL
+            includeFontPadding = false
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(primaryTextColor)
+            minHeight = dp(40)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            contentDescription = "Alternar bloqueo del scooter"
+            setOnClickListener { requestLockToggle() }
+        }
+        addView(lockToggleButton)
+        addView(TextView(this@LabActivity).apply {
+            text = "Seguridad"
+            setTextColor(secondaryTextColor)
+            textSize = 12f
+            includeFontPadding = false
+        })
     }
 
     private fun bottomNavigation(): View = LinearLayout(this).apply {
         gravity = Gravity.CENTER
         setPadding(dp(6), dp(6), dp(6), dp(6))
         setBackgroundDrawable(roundBackground(navigationColor, 22))
-        dashboardTabButton = navigationButton("Dashboard") { showDashboard() }
-        settingsTabButton = navigationButton("Settings") { showSettings() }
-        addView(dashboardTabButton, LinearLayout.LayoutParams(0, dp(46), 1f))
-        addView(settingsTabButton, LinearLayout.LayoutParams(0, dp(46), 1f))
+        dashboardTabButton = navigationButton("⌂\nHome") { showDashboard() }
+        val history = navigationButton("◷\nHistorial") { showComingSoon("Historial") }
+        val ride = navigationButton("⌁\nRuta") { showComingSoon("Rutas") }
+        settingsTabButton = navigationButton("⚙\nAjustes") { showSettings() }
+        listOf(dashboardTabButton, history, ride, settingsTabButton).forEach {
+            addView(it, LinearLayout.LayoutParams(0, dp(58), 1f))
+        }
         updateNavigation()
+    }
+
+    private fun showComingSoon(feature: String) {
+        Toast.makeText(this, "$feature: próximamente", Toast.LENGTH_SHORT).show()
     }
 
     private fun navigationButton(label: String, action: () -> Unit): Button = Button(this).apply {
         text = label
         isAllCaps = false
-        textSize = 14f
+        textSize = 11f
         typeface = Typeface.DEFAULT_BOLD
+        setTextColor(secondaryTextColor)
+        setBackgroundDrawable(roundBackground(Color.TRANSPARENT, 20))
         setOnClickListener { action() }
     }
 
@@ -492,31 +660,19 @@ class LabActivity : Activity() {
         visibility = View.GONE
         setPadding(dp(20), dp(18), dp(20), dp(18))
         addView(TextView(this@LabActivity).apply {
-            text = "LOCK"
+            text = "BLOQUEO"
             setTextColor(mutedTextColor)
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             letterSpacing = 0.1f
         })
         controlDetail = TextView(this@LabActivity).apply {
-            text = "Choose an action. Every change requires confirmation."
+            text = "Elegí una acción y confirmala antes de enviarla."
             setTextColor(secondaryTextColor)
             textSize = 15f
             setPadding(0, dp(8), 0, dp(12))
         }
         addView(controlDetail)
-        lockToggleButton = Button(this@LabActivity).apply {
-            text = "Lock or unlock scooter"
-            isAllCaps = false
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            setBackgroundDrawable(roundBackground(primaryActionColor, 14))
-            setOnClickListener { requestLockToggle() }
-        }
-        addView(lockToggleButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ))
     }
 
     private fun chargeLimitCard(): LinearLayout = card().apply {
@@ -567,6 +723,29 @@ class LabActivity : Activity() {
         addView(startingSpeedButton)
     }
 
+    private fun driveSpeedLimitCard(): LinearLayout = card().apply {
+        addView(TextView(this@LabActivity).apply {
+            text = "DRIVE MODE SPEED LIMIT · EXPERIMENTAL"
+            setTextColor(mutedTextColor)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        driveSpeedLimitValue = TextView(this@LabActivity).apply {
+            text = "Connect to read current value"
+            setTextColor(primaryTextColor)
+            textSize = 18f
+            setPadding(0, dp(10), 0, dp(12))
+        }
+        addView(driveSpeedLimitValue)
+        driveSpeedLimitButton = Button(this@LabActivity).apply {
+            text = "Set Drive limit"
+            isAllCaps = false
+            isEnabled = false
+            setOnClickListener { chooseDriveSpeedLimit() }
+        }
+        addView(driveSpeedLimitButton)
+    }
+
     private fun showDashboard() {
         dashboardContent.visibility = View.VISIBLE
         settingsContent.visibility = View.GONE
@@ -582,10 +761,10 @@ class LabActivity : Activity() {
     private fun updateNavigation() {
         if (!::dashboardTabButton.isInitialized || !::settingsTabButton.isInitialized) return
         val dashboardVisible = dashboardContent.visibility == View.VISIBLE
-        dashboardTabButton.setTextColor(if (dashboardVisible) Color.WHITE else mutedTextColor)
-        dashboardTabButton.setBackgroundDrawable(roundBackground(if (dashboardVisible) primaryActionColor else Color.TRANSPARENT, 16))
-        settingsTabButton.setTextColor(if (dashboardVisible) mutedTextColor else Color.WHITE)
-        settingsTabButton.setBackgroundDrawable(roundBackground(if (dashboardVisible) Color.TRANSPARENT else primaryActionColor, 16))
+        dashboardTabButton.setTextColor(if (dashboardVisible) Color.rgb(18, 22, 14) else secondaryTextColor)
+        dashboardTabButton.setBackgroundDrawable(roundBackground(if (dashboardVisible) selectedNavColor else Color.TRANSPARENT, 22))
+        settingsTabButton.setTextColor(if (dashboardVisible) secondaryTextColor else Color.rgb(18, 22, 14))
+        settingsTabButton.setBackgroundDrawable(roundBackground(if (dashboardVisible) Color.TRANSPARENT else selectedNavColor, 22))
     }
 
     private fun refreshReadiness() {
@@ -615,8 +794,12 @@ class LabActivity : Activity() {
 
         val ready = bluetoothReady && addressReady && secretReady
         startButton.isEnabled = ready && !testStarted
-        scooterNameValue.text = if (addressReady) selectedTargetName() else "Scooter not selected"
-        batteryValue.text = "Battery  —  ·  Range  —"
+        scooterNameValue.text = if (addressReady) selectedTargetName() else "Scooter no seleccionado"
+        connectionValue.text = if (addressReady) "Desconectado" else "Configura tu scooter"
+        updateLockToggleLabel()
+        batteryValue.text = "—%"
+        rangeValue.text = "— km"
+        modeValue.text = "—"
         renderChargingStatus()
         setupButton.visibility = if (addressReady) View.GONE else View.VISIBLE
         if (!ready) {
@@ -682,10 +865,15 @@ class LabActivity : Activity() {
 
         testStarted = true
         startButton.isEnabled = false
+        lastKnownLockState = null
+        updateLockToggleLabel()
+        setControlsEnabled(false)
         clearPendingApplicationFrames()
         applicationInitializationHandler.removeCallbacksAndMessages(null)
         chargeLimitReadHandler.removeCallbacksAndMessages(null)
         startingSpeedReadHandler.removeCallbacksAndMessages(null)
+        driveSpeedReadHandler.removeCallbacksAndMessages(null)
+        lockStateReadHandler.removeCallbacksAndMessages(null)
         chargingReadHandler.removeCallbacksAndMessages(null)
         session?.close()
         session = ScooterSessionConnection(this, device, effectiveLtmk, object : ScooterSessionConnection.Listener {
@@ -708,7 +896,12 @@ class LabActivity : Activity() {
                 session?.close()
                 session = null
                 startingSpeedReadHandler.removeCallbacksAndMessages(null)
+                driveSpeedReadHandler.removeCallbacksAndMessages(null)
                 chargingReadHandler.removeCallbacksAndMessages(null)
+                lockStateReadHandler.removeCallbacksAndMessages(null)
+                lockStateReader?.cancel()
+                lastKnownLockState = null
+                updateLockToggleLabel()
                 chargingStatusReader?.cancel()
                 lastKnownChargingStatus = null
                 renderChargingStatus()
@@ -716,6 +909,10 @@ class LabActivity : Activity() {
                     startingSpeedValue.text = "Connection lost; starting speed must be verified again."
                 }
                 pendingStartingSpeed = null
+                pendingDriveSpeedLimit = null
+                pendingDriveSpeedVerification = null
+                lastKnownDriveSpeedLimit = null
+                driveSpeedLimitValue.text = "Drive limit unavailable"
                 pendingStartingVerification = null
                 setControlsEnabled(false)
                 showFailure("No se pudo preparar la conexión: $reason")
@@ -740,16 +937,21 @@ class LabActivity : Activity() {
             applicationChannel?.clear()
             lastKnownBatteryPercentage = null
             lastKnownPowerMode = null
+            lastKnownLockState = null
             lastKnownChargeLimit = null
             pendingChargeLimit = null
             pendingChargeVerification = null
             pendingStartingSpeed = null
             pendingStartingVerification = null
             lastKnownStartingSpeed = null
+            pendingDriveSpeedLimit = null
+            pendingDriveSpeedVerification = null
+            lastKnownDriveSpeedLimit = null
             lastKnownChargingStatus = null
             lastChargingUpdateMillis = 0L
             chargeLimitValue.text = "Reading charge limit…"
             startingSpeedValue.text = "Reading starting speed…"
+            driveSpeedLimitValue.text = "Reading Drive limit…"
             renderDashboardTelemetry()
             renderChargingStatus()
             // Xiaomi Home restarts this counter on every authenticated BLE session. Its first
@@ -760,9 +962,11 @@ class LabActivity : Activity() {
             val cipher = MiotBleApplicationCipher(sessionKey)
             commandComposer = MiotScooterCommandComposer.forInitializedSession(requestIds, cipher)
             batteryReader = MiotScooterBatteryReader(requestIds, cipher)
+            lockStateReader = MiotScooterLockStateReader(requestIds, cipher)
             powerModeReader = MiotScooterPowerModeReader(requestIds, cipher)
             chargeLimitReader = MiotScooterChargeLimitReader(requestIds, cipher)
             startingSpeedReader = MiotScooterStartingSpeedReader(requestIds, cipher)
+            driveSpeedLimitReader = MiotScooterDriveSpeedLimitReader(requestIds, cipher)
             chargingStatusReader = MiotScooterChargingStatusReader(requestIds, cipher)
             applicationInitializer = MiotScooterApplicationInitializer(requestIds, cipher)
             inboundResponseConsumer = MiotScooterInboundResponseConsumer(cipher)
@@ -771,6 +975,8 @@ class LabActivity : Activity() {
             sessionKey.fill(0)
         }
         controlsCard.visibility = View.GONE
+        controlDetail.text = "Leyendo el estado actual del candado…"
+        updateLockToggleLabel()
         setControlsEnabled(false)
         while (pendingApplicationFrames.isNotEmpty()) {
             val frame = pendingApplicationFrames.removeFirst()
@@ -817,16 +1023,79 @@ class LabActivity : Activity() {
     private fun finishApplicationInitialization() {
         applicationChannel?.markReady()
         controlsCard.visibility = View.VISIBLE
-        setControlsEnabled(true)
-        updateLockToggleLabel()
-        controlDetail.text = "Connected. Choose an action and confirm it before sending."
+        controlDetail.text = "Leyendo el estado actual del candado…"
         showStatus(
             title = "Connected",
             detail = "",
             color = readyColor,
         )
+        requestLockState()
+    }
+
+    /** Reads the actual boolean lock property before enabling the toggle. */
+    private fun requestLockState() {
+        val reader = lockStateReader ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY) return
+        try {
+            lastKnownLockState = null
+            updateLockToggleLabel()
+            controlDetail.text = "Leyendo el estado actual del candado…"
+            setControlsEnabled(false)
+            currentSession.writeApplicationFrames(reader.begin())
+            lockStateReadHandler.removeCallbacksAndMessages(null)
+            lockStateReadHandler.postDelayed({
+                if (lockStateReader !== reader || reader.state != MiotScooterLockStateReader.State.WAITING_FLOW_ACK) {
+                    return@postDelayed
+                }
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) {
+                    lockStateReadTimeoutRunnable.run()
+                }
+            }, observedFlowWindowMillis)
+            lockStateReadHandler.postDelayed(lockStateReadTimeoutRunnable, batteryReadTimeoutMillis)
+        } catch (_: Exception) {
+            reader.cancel()
+            lockStateReadHandler.removeCallbacksAndMessages(null)
+            lastKnownLockState = null
+            updateLockToggleLabel()
+            controlDetail.text = "No se pudo consultar el estado del candado. Reconectá para volver a intentarlo."
+            setControlsEnabled(true)
+            Log.i(logTag, "Lock-state read could not start; lock control remains disabled.")
+            requestBatteryPercentage()
+        }
+    }
+
+    private fun consumeLockStateResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val reader = lockStateReader ?: return
+        if (reader.state != MiotScooterLockStateReader.State.WAITING_RESPONSE) return
+        val locked = reader.onInboundResponse(metadata)
+        if (locked == null) {
+            if (metadata.serviceId == MiotScooterLockStateReader.serviceId &&
+                metadata.propertyId == MiotScooterLockStateReader.propertyId
+            ) {
+                Log.i(
+                    logTag,
+                    "Lock-property response not accepted: " +
+                        (reader.responseRejectionReason(metadata) ?: "transaction_mismatch") + ".",
+                )
+            }
+            return
+        }
+        lockStateReadHandler.removeCallbacksAndMessages(null)
+        lastKnownLockState = locked
+        updateLockToggleLabel()
+        controlDetail.text = if (locked) {
+            "El scooter está bloqueado. Podés desbloquearlo."
+        } else {
+            "El scooter está desbloqueado. Podés bloquearlo."
+        }
+        Log.i(logTag, "Lock-state read completed for the requested MiOT property.")
+        setControlsEnabled(true)
         requestBatteryPercentage()
-        scheduleChargingStatusRead()
     }
 
     /** Reads Xiaomi Home's documented UINT8 battery property without changing scooter state. */
@@ -970,7 +1239,7 @@ class LabActivity : Activity() {
             pendingStartingVerification = null
             lastKnownStartingSpeed = null
             restoreControlsAfterChargingRead()
-            scheduleChargingStatusRead()
+            requestDriveSpeedLimit()
         }
     }
 
@@ -986,6 +1255,59 @@ class LabActivity : Activity() {
             else -> "Current: $speed km/h"
         }
         Log.i(logTag, "Starting-speed read completed for the requested MiOT property.")
+        setControlsEnabled(true)
+        driveSpeedReadHandler.postDelayed(::requestDriveSpeedLimit, observedFlowWindowMillis)
+    }
+
+    private fun requestDriveSpeedLimit() {
+        val reader = driveSpeedLimitReader ?: return
+        val currentSession = session ?: return
+        if (reader.state == MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterDriveSpeedLimitReader.State.WAITING_RESPONSE
+        ) return
+        try {
+            currentSession.writeApplicationFrames(reader.begin())
+            driveSpeedReadHandler.removeCallbacksAndMessages(null)
+            driveSpeedReadHandler.postDelayed({
+                if (driveSpeedLimitReader !== reader ||
+                    reader.state != MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK
+                ) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            driveSpeedReadHandler.postDelayed(driveSpeedReadTimeoutRunnable, batteryReadTimeoutMillis)
+            setControlsEnabled(pendingDriveSpeedVerification == null)
+        } catch (_: Exception) {
+            reader.cancel()
+            driveSpeedLimitValue.text = "Drive limit unavailable"
+            pendingDriveSpeedVerification = null
+            lastKnownDriveSpeedLimit = null
+            restoreControlsAfterChargingRead()
+            scheduleChargingStatusRead()
+        }
+    }
+
+    private fun consumeDriveSpeedLimitResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val speed = driveSpeedLimitReader?.onInboundResponse(metadata) ?: return
+        driveSpeedReadHandler.removeCallbacksAndMessages(null)
+        lastKnownDriveSpeedLimit = speed
+        val requested = pendingDriveSpeedVerification
+        pendingDriveSpeedVerification = null
+        driveSpeedLimitValue.text = when {
+            requested != null && requested != speed -> "Current: $speed km/h · $requested was not applied"
+            else -> "Current: $speed km/h"
+        }
+        if (requested != null) {
+            if (requested == speed) {
+                showStatus("Drive limit verified", "Scooter reports $speed km/h after the change.", readyColor)
+            } else {
+                showFailure("Scooter reports $speed km/h; the requested $requested km/h was not applied.")
+            }
+        }
+        Log.i(logTag, "Drive-limit read completed from device information.")
         setControlsEnabled(true)
         scheduleChargingStatusRead()
     }
@@ -1015,7 +1337,10 @@ class LabActivity : Activity() {
             chargeLimitReader?.state in setOf(MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK,
                 MiotScooterChargeLimitReader.State.WAITING_RESPONSE) ||
             startingSpeedReader?.state in setOf(MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK,
-                MiotScooterStartingSpeedReader.State.WAITING_RESPONSE)
+                MiotScooterStartingSpeedReader.State.WAITING_RESPONSE) ||
+            driveSpeedLimitReader?.state in setOf(MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK,
+                MiotScooterDriveSpeedLimitReader.State.WAITING_RESPONSE) ||
+            pendingDriveSpeedVerification != null
         ) {
             scheduleChargingStatusRead(chargingBusyRetryMillis)
             return
@@ -1071,7 +1396,10 @@ class LabActivity : Activity() {
     }
 
     private fun renderDashboardTelemetry() {
-        val battery = lastKnownBatteryPercentage?.let { "$it%" } ?: "—"
+        val battery = lastKnownBatteryPercentage?.let { "$it%" } ?: "—%"
+        val remainingRange = lastKnownBatteryPercentage?.let { percentage ->
+            (percentage * practicalFullChargeRangeKm + 50) / 100
+        }
         val mode = when (lastKnownPowerMode) {
             1 -> "Walk"
             2 -> "Drive"
@@ -1079,7 +1407,9 @@ class LabActivity : Activity() {
             4 -> "Boost"
             else -> "—"
         }
-        batteryValue.text = "Battery  $battery  ·  $mode"
+        batteryValue.text = battery
+        rangeValue.text = remainingRange?.let { "$it km" } ?: "— km"
+        modeValue.text = mode
     }
 
     /** This scooter exposes the observed startup window without a separate flow ACK. */
@@ -1125,6 +1455,10 @@ class LabActivity : Activity() {
     private fun requestLockChange(locked: Boolean) {
         val action = if (locked) "bloquear" else "desbloquear"
         val composer = commandComposer
+        if (lastKnownLockState == null || locked == lastKnownLockState) {
+            controlDetail.text = "El estado actual del candado no está confirmado. Reconectá para volver a leerlo."
+            return
+        }
         if (applicationChannel?.state != ScooterApplicationChannelState.READY) {
             showFailure("El canal de aplicación aún está terminando su inicialización.")
             return
@@ -1134,6 +1468,10 @@ class LabActivity : Activity() {
             composer.state == MiotScooterCommandState.WAITING_RESPONSE
         ) {
             showFailure("Todavía hay una operación en curso.")
+            return
+        }
+        if (locked) {
+            beginLockChange(locked = true)
             return
         }
         AlertDialog.Builder(this)
@@ -1153,12 +1491,7 @@ class LabActivity : Activity() {
         when (lastKnownLockState) {
             true -> requestLockChange(locked = false)
             false -> requestLockChange(locked = true)
-            null -> AlertDialog.Builder(this)
-                .setTitle("Choose lock action")
-                .setItems(arrayOf("Lock scooter", "Unlock scooter")) { _, selected ->
-                    requestLockChange(locked = selected == 0)
-                }
-                .show()
+            null -> controlDetail.text = "Esperá a que la app confirme el estado del candado."
         }
     }
 
@@ -1310,6 +1643,71 @@ class LabActivity : Activity() {
         }
     }
 
+    private fun chooseDriveSpeedLimit() {
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY) return
+        val selectedSpeed = lastKnownDriveSpeedLimit ?: return
+        val speeds = intArrayOf(15, 20, 25, 32)
+        val options = speeds.map { "$it km/h" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Drive mode speed limit")
+            .setSingleChoiceItems(options, speeds.indexOf(selectedSpeed)) { dialog, index ->
+                dialog.dismiss()
+                val speed = speeds[index]
+                if (speed == lastKnownDriveSpeedLimit) return@setSingleChoiceItems
+                AlertDialog.Builder(this)
+                    .setTitle("Set Drive limit to $speed km/h?")
+                    .setMessage("Keep the scooter stationary and out of Boost mode. " +
+                        "The firmware may reject a limit incompatible with this scooter's SKU. " +
+                        "The app will read the value back before reporting it applied.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Confirm") { _, _ -> beginDriveSpeedLimitChange(speed) }
+                    .show()
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun beginDriveSpeedLimitChange(speedKmh: Int) {
+        if (chargingStatusReadInProgress()) {
+            driveSpeedLimitValue.text = "Charging telemetry is updating; retry shortly."
+            return
+        }
+        val composer = commandComposer ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
+            lastKnownDriveSpeedLimit == null || pendingDriveSpeedVerification != null ||
+            chargeLimitReader?.state in setOf(MiotScooterChargeLimitReader.State.WAITING_FLOW_ACK,
+                MiotScooterChargeLimitReader.State.WAITING_RESPONSE) ||
+            startingSpeedReader?.state in setOf(MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK,
+                MiotScooterStartingSpeedReader.State.WAITING_RESPONSE) ||
+            driveSpeedLimitReader?.state in setOf(MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK,
+                MiotScooterDriveSpeedLimitReader.State.WAITING_RESPONSE) ||
+            composer.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
+        ) return
+        try {
+            val frames = composer.beginDriveSpeedLimit(speedKmh)
+            pendingDriveSpeedLimit = speedKmh
+            lastKnownDriveSpeedLimit = null
+            setControlsEnabled(false)
+            driveSpeedLimitValue.text = "Sending $speedKmh km/h…"
+            currentSession.writeApplicationFrames(frames)
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            commandTimeoutHandler.postDelayed({
+                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    composer.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { composer.abort() }
+            }, observedFlowWindowMillis)
+            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
+        } catch (_: Exception) {
+            composer.abort()
+            pendingDriveSpeedLimit = null
+            driveSpeedLimitValue.text = "Write could not start; reconnect to verify."
+            setControlsEnabled(true)
+        }
+    }
+
     private fun processApplicationFrame(frame: ByteArray) {
         val channel = applicationChannel
         val composer = commandComposer
@@ -1327,9 +1725,11 @@ class LabActivity : Activity() {
                         consumeInitialSingleControlPayload(initialPayload)?.let { metadata ->
                             composer.onInboundResponse(metadata)
                             consumeBatteryResponse(metadata)
+                            consumeLockStateResponse(metadata)
                             consumePowerModeResponse(metadata)
                             consumeChargeLimitResponse(metadata)
                             consumeStartingSpeedResponse(metadata)
+                            consumeDriveSpeedLimitResponse(metadata)
                             consumeChargingStatusResponse(metadata)
                         }
                         renderCommandState(composer)
@@ -1359,9 +1759,11 @@ class LabActivity : Activity() {
                     )
                     composer.onInboundResponse(responseMetadata)
                     consumeBatteryResponse(responseMetadata)
+                    consumeLockStateResponse(responseMetadata)
                     consumePowerModeResponse(responseMetadata)
                     consumeChargeLimitResponse(responseMetadata)
                     consumeStartingSpeedResponse(responseMetadata)
+                    consumeDriveSpeedLimitResponse(responseMetadata)
                     consumeChargingStatusResponse(responseMetadata)
                     renderCommandState(composer)
                 } else {
@@ -1413,6 +1815,11 @@ class LabActivity : Activity() {
                 session?.writeApplicationFrames(batteryFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
+            val lockStateFrames = lockStateReader?.onApplicationFrame(frame).orEmpty()
+            if (lockStateFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(lockStateFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
             val powerModeFrames = powerModeReader?.onApplicationFrame(frame).orEmpty()
             if (powerModeFrames.isNotEmpty()) {
                 session?.writeApplicationFrames(powerModeFrames)
@@ -1428,6 +1835,11 @@ class LabActivity : Activity() {
                 session?.writeApplicationFrames(startingSpeedFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
+            val driveSpeedFrames = driveSpeedLimitReader?.onApplicationFrame(frame).orEmpty()
+            if (driveSpeedFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(driveSpeedFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
             val chargingFrames = chargingStatusReader?.onApplicationFrame(frame).orEmpty()
             if (chargingFrames.isNotEmpty()) {
                 session?.writeApplicationFrames(chargingFrames)
@@ -1441,6 +1853,10 @@ class LabActivity : Activity() {
                 startingSpeedValue.text = "Channel error; reconnect to verify starting speed."
                 pendingStartingSpeed = null
             }
+            if (pendingDriveSpeedLimit != null) {
+                driveSpeedLimitValue.text = "Channel error; reconnect to verify Drive limit."
+                pendingDriveSpeedLimit = null
+            }
             controlDetail.text = "La conexión no pudo completar la operación."
             setControlsEnabled(true)
             showFailure("No se pudo continuar la operación de aplicación.")
@@ -1448,7 +1864,8 @@ class LabActivity : Activity() {
     }
 
     private fun renderCommandState(composer: MiotScooterCommandComposer) {
-        if (pendingLockState == null && pendingChargeLimit == null && pendingStartingSpeed == null) return
+        if (pendingLockState == null && pendingChargeLimit == null && pendingStartingSpeed == null &&
+            pendingDriveSpeedLimit == null) return
         when (composer.state) {
                 MiotScooterCommandState.COMPLETED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
@@ -1466,6 +1883,14 @@ class LabActivity : Activity() {
                         startingSpeedValue.text = "Acknowledged $speed km/h; reading back…"
                         setControlsEnabled(true)
                         startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
+                        return
+                    }
+                    pendingDriveSpeedLimit?.let { speed ->
+                        pendingDriveSpeedLimit = null
+                        pendingDriveSpeedVerification = speed
+                        driveSpeedLimitValue.text = "Acknowledged $speed km/h; reading back…"
+                        setControlsEnabled(false)
+                        driveSpeedReadHandler.postDelayed(::requestDriveSpeedLimit, observedFlowWindowMillis)
                         return
                     }
                     pendingLockState?.let { locked ->
@@ -1489,8 +1914,14 @@ class LabActivity : Activity() {
                         startingSpeedValue.text = "Write rejected or unconfirmed; reading back…"
                         startingSpeedReadHandler.postDelayed(::requestStartingSpeed, observedFlowWindowMillis)
                     }
+                    pendingDriveSpeedLimit?.let { speed ->
+                        pendingDriveSpeedVerification = speed
+                        driveSpeedLimitValue.text = "Write rejected or unconfirmed; reading back…"
+                        driveSpeedReadHandler.postDelayed(::requestDriveSpeedLimit, observedFlowWindowMillis)
+                    }
                     pendingChargeLimit = null
                     pendingStartingSpeed = null
+                    pendingDriveSpeedLimit = null
                     pendingLockState = null
                     controlDetail.text = "El canal rechazó la orden o recibió una respuesta inválida."
                     setControlsEnabled(true)
@@ -1524,15 +1955,22 @@ class LabActivity : Activity() {
     }
 
     private fun setControlsEnabled(enabled: Boolean) {
-        if (::lockToggleButton.isInitialized) lockToggleButton.isEnabled = enabled
-        if (::chargeLimitButton.isInitialized) chargeLimitButton.isEnabled = enabled &&
+        val actionsEnabled = enabled && pendingDriveSpeedVerification == null
+        if (::lockToggleButton.isInitialized) lockToggleButton.isEnabled = actionsEnabled &&
+            applicationChannel?.state == ScooterApplicationChannelState.READY && lastKnownLockState != null
+        if (::chargeLimitButton.isInitialized) chargeLimitButton.isEnabled = actionsEnabled &&
             applicationChannel?.state == ScooterApplicationChannelState.READY &&
             lastKnownChargeLimit != null && pendingChargeVerification == null
-        if (::startingSpeedButton.isInitialized) startingSpeedButton.isEnabled = enabled &&
+        if (::startingSpeedButton.isInitialized) startingSpeedButton.isEnabled = actionsEnabled &&
             applicationChannel?.state == ScooterApplicationChannelState.READY &&
             pendingStartingVerification == null &&
             startingSpeedReader?.state !in setOf(MiotScooterStartingSpeedReader.State.WAITING_FLOW_ACK,
                 MiotScooterStartingSpeedReader.State.WAITING_RESPONSE)
+        if (::driveSpeedLimitButton.isInitialized) driveSpeedLimitButton.isEnabled = actionsEnabled &&
+            applicationChannel?.state == ScooterApplicationChannelState.READY &&
+            lastKnownDriveSpeedLimit != null && pendingDriveSpeedVerification == null &&
+            driveSpeedLimitReader?.state !in setOf(MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK,
+                MiotScooterDriveSpeedLimitReader.State.WAITING_RESPONSE)
     }
 
     private fun chargingStatusReadInProgress(): Boolean = chargingStatusReader?.state in setOf(
@@ -1542,6 +1980,7 @@ class LabActivity : Activity() {
 
     private fun restoreControlsAfterChargingRead() {
         if (pendingLockState != null || pendingChargeLimit != null || pendingStartingSpeed != null ||
+            pendingDriveSpeedLimit != null ||
             commandComposer?.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
                 MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
         ) return
@@ -1551,9 +1990,18 @@ class LabActivity : Activity() {
     private fun updateLockToggleLabel() {
         if (!::lockToggleButton.isInitialized) return
         lockToggleButton.text = when (lastKnownLockState) {
-            true -> "Unlock scooter"
-            false -> "Lock scooter"
-            null -> "Lock or unlock scooter"
+            true -> "Desbloquear"
+            false -> "Bloquear"
+            null -> when {
+                lockStateReader?.state == MiotScooterLockStateReader.State.FAILED -> "Estado no disponible"
+                testStarted -> "Leyendo estado…"
+                else -> "Conectar para leer"
+            }
+        }
+        lockToggleButton.contentDescription = when (lastKnownLockState) {
+            true -> "Desbloquear scooter"
+            false -> "Bloquear scooter"
+            null -> lockToggleButton.text.toString()
         }
     }
 
@@ -1570,14 +2018,25 @@ class LabActivity : Activity() {
         Log.i(logTag, "$title: $detail")
         val compactTitle = when {
             color == failureColor -> "Connection issue"
+            title == "Setup needed" -> "Setup needed"
             title == "Connected" || title.contains("confirmada", ignoreCase = true) ||
                 title.contains("inicializado", ignoreCase = true) -> "Connected"
             title.contains("orden", ignoreCase = true) -> "Updating lock"
-            title == "Ready" -> "Ready"
+            title == "Ready" -> "Desconectado"
             else -> "Connecting"
         }
         val compactDetail = if (color == failureColor) detail else ""
         runOnUiThread {
+            if (::connectionValue.isInitialized) {
+                connectionValue.text = when (compactTitle) {
+                    "Connected" -> "Conectado"
+                    "Connecting" -> "Conectando"
+                    "Updating lock" -> "Conectado"
+                    "Ready" -> "Desconectado"
+                    "Setup needed" -> "Configurar en Ajustes"
+                    else -> if (color == failureColor) "Error de conexión" else "Conectando"
+                }
+            }
             statusLabel.text = compactTitle
             statusLabel.setTextColor(color)
             statusDetail.text = compactDetail
@@ -1819,11 +2278,14 @@ class LabActivity : Activity() {
         const val observedMiotInitialCounter = 1
         const val scanDurationMillis = 12_000L
         const val automaticConnectionDelayMillis = 450L
+        const val practicalFullChargeRangeKm = 25
 
-        val backgroundColor = Color.rgb(8, 15, 29)
-        val heroCardColor = Color.rgb(18, 35, 57)
+        val backgroundColor = Color.rgb(10, 10, 12)
+        val heroCardColor = Color.rgb(18, 18, 22)
         val cardColor = Color.rgb(17, 29, 48)
-        val navigationColor = Color.rgb(20, 33, 54)
+        val tileColor = Color.rgb(27, 27, 32)
+        val navigationColor = Color.rgb(27, 27, 32)
+        val selectedNavColor = Color.rgb(215, 255, 99)
         val candidateColor = Color.rgb(27, 45, 70)
         val selectedCandidateColor = Color.rgb(16, 73, 81)
         val primaryActionColor = Color.rgb(14, 116, 144)

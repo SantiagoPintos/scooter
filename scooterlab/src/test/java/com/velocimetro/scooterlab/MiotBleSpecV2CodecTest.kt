@@ -30,6 +30,55 @@ class MiotBleSpecV2CodecTest {
     }
 
     @Test
+    fun lockStateReaderAcceptsOnlyMatchingAuthenticatedGetResponse() {
+        val key = ByteArray(64) { (it + 41).toByte() }
+        val reader = MiotScooterLockStateReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(key))
+        reader.begin()
+        reader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 1, 1, 2, 9, 0, lockStateValue = true),
+        ))
+        assertEquals(true, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 1, 1, 2, 10, 0, lockStateValue = true),
+        ))
+        assertEquals(MiotScooterLockStateReader.State.COMPLETED, reader.state)
+
+        val unlockedReader = MiotScooterLockStateReader(
+            MiotBleSpecRequestCounter(), MiotBleApplicationCipher(key),
+        )
+        unlockedReader.begin()
+        unlockedReader.advanceWithoutFlowAcknowledgement()
+        assertEquals(false, unlockedReader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 10, 0, lockStateValue = false),
+        ))
+    }
+
+    @Test
+    fun lockStateExtractorRetainsOnlyValidBooleanFromAuthenticatedGetResponse() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readValue(json: String, serviceId: Int = 2, propertyId: Int = 10, operation: Int = 3): Boolean? {
+            val jsonBytes = json.toByteArray(Charsets.UTF_8)
+            val length = 11 + jsonBytes.size
+            val plaintext = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or length).toShort()).putShort(2).put(operation.toByte()).put(1)
+                .put(serviceId.toByte()).putShort(propertyId.toShort()).putShort(0).put(jsonBytes).array()
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext))?.lockStateValue
+        }
+        assertEquals(false, readValue("{\"ls\":0,\"dg\":25}"))
+        assertEquals(true, readValue("{\"ls\":1}", operation = 1))
+        assertEquals(false, readValue("{ \"ls\" : false }"))
+        assertEquals(true, readValue("{ \"ls\" : true }"))
+        assertEquals(null, readValue("{\"ls\":2}"))
+        assertEquals(null, readValue("{\"ls\":1}", serviceId = 3))
+        assertEquals(null, readValue("{\"ls\":1}", propertyId = 9))
+        assertEquals(null, readValue("{\"ls\":1}", operation = 4))
+    }
+
+    @Test
     fun chargeLimitUsesConfirmedPropertyAndFivePercentSteps() {
         val packet = MiotBleSpecV2Codec.setScooterChargeLimit(2, 80)
         val fields = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
@@ -63,6 +112,68 @@ class MiotBleSpecV2CodecTest {
                 throw AssertionError("Expected invalid starting speed to be rejected")
             } catch (_: IllegalArgumentException) { /* Expected. */ }
         }
+    }
+
+    @Test
+    fun driveLimitWritesControlPropertyFourThirtyFourNotFiveThirtyFour() {
+        for (speed in listOf(15, 20, 25, 32)) {
+            val fields = ByteBuffer.wrap(MiotBleSpecV2Codec.setScooterDriveSpeedLimit(2, speed))
+                .order(ByteOrder.LITTLE_ENDIAN)
+            fields.position(4)
+            assertEquals(0, fields.get().toInt() and 0xff)
+            assertEquals(1, fields.get().toInt() and 0xff)
+            assertEquals(4, fields.get().toInt() and 0xff)
+            assertEquals(34, fields.short.toInt() and 0xffff)
+            assertEquals(0x1001, fields.short.toInt() and 0xffff)
+            assertEquals(speed, fields.get().toInt() and 0xff)
+        }
+        for (speed in listOf(0, 14, 16, 26, 33)) {
+            try {
+                MiotBleSpecV2Codec.setScooterDriveSpeedLimit(2, speed)
+                throw AssertionError("Expected unsupported D-mode limit to be rejected")
+            } catch (_: IllegalArgumentException) { /* Expected. */ }
+        }
+    }
+
+    @Test
+    fun driveLimitReadAcceptsOnlyMatchingDeviceInformationAndWriteResponse() {
+        val key = ByteArray(64) { (it + 41).toByte() }
+        val reader = MiotScooterDriveSpeedLimitReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(key))
+        reader.begin()
+        reader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 5, 10, 0, driveSpeedLimitValue = 15)))
+        assertEquals(15, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 10, 0, driveSpeedLimitValue = 15)))
+        assertEquals(MiotScooterDriveSpeedLimitReader.State.COMPLETED, reader.state)
+
+        val writer = MiotScooterCommandComposer(key)
+        writer.beginDriveSpeedLimit(32)
+        writer.advanceWithoutFlowAcknowledgement()
+        assertEquals(false, writer.onInboundResponse(MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 5, 34, 0)))
+        assertEquals(true, writer.onInboundResponse(MiotInboundPayloadMetadata(11, 11, 2, 1, 1, 4, 34, 0)))
+    }
+
+    @Test
+    fun driveLimitExtractorRetainsOnlyValidDgScalar() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readValue(json: String, serviceId: Int = 2): Int? {
+            val bytes = json.toByteArray()
+            val length = 11 + bytes.size
+            val plaintext = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or length).toShort()).putShort(2).put(3).put(1)
+                .put(serviceId.toByte()).putShort(10).putShort(0).put(bytes).array()
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext))?.driveSpeedLimitValue
+        }
+        assertEquals(15, readValue("{\"dg\":15,\"other\":1}"))
+        assertEquals(32, readValue("{ \"dg\" : 32 }"))
+        assertEquals(null, readValue("{\"dg\":150}"))
+        assertEquals(null, readValue("{\"dg\":32x}"))
+        assertEquals(null, readValue("{\"dg\":32}", serviceId = 5))
     }
 
     @Test

@@ -17,6 +17,10 @@ authenticated MiOT response before reporting the action as confirmed.
    steps. A change requires a separate confirmation. The app reads the value back before
    treating the requested limit as applied. See [Charge limit](../docs/CHARGE_LIMIT.md) for
    protocol evidence and the current physical-test status.
+5. The experimental Drive-mode limit in **Settings** reads its current value from scooter
+   device information. Any requested change requires confirmation and is checked by a fresh
+   read. See [Drive-mode speed limit](../docs/DRIVE_SPEED_LIMIT.md) for the unverified
+   physical-test status and SKU caveat.
 
 The selected Bluetooth address is held in private app preferences. The local credential lives at
 `files/lab_credential.bin`, enables later connections without Xiaomi Home, is never shown in the

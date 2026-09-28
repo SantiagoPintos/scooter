@@ -2,9 +2,9 @@
 <resources>
     <style name="Theme.ScooterLab" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#22D3EE</item>
-        <item name="android:navigationBarColor">#080F1D</item>
-        <item name="android:statusBarColor">#080F1D</item>
+        <item name="android:colorAccent">#D7FF63</item>
+        <item name="android:navigationBarColor">#0A0A0C</item>
+        <item name="android:statusBarColor">#0A0A0C</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

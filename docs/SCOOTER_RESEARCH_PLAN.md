@@ -41,21 +41,26 @@ Keys, raw captures, and credentials never belong in the repository.
 
 - The app remembers the selected scooter and its local credential.
 - When setup already exists, the app starts an automatic connection attempt at launch.
-- The dashboard shows a compact connection state, a future-ready battery/range area, a lock
-  control, and Settings for the one-time device selection.
-- Battery, range, and an authoritative current lock state remain unimplemented. They must stay
-  visibly unavailable until their respective MiOT reads are understood and validated.
+- The dashboard shows battery, power mode, a practical range estimate, and a lock toggle.
+- Battery telemetry is read over MiOT. The lock toggle reads the authenticated boolean state
+  from property `4.6` before enabling the opposite action; the first supervised physical test
+  of that read path is still required.
+- Range is an estimate based on approximately 25 km at full charge from observed use, not
+  scooter-reported range telemetry.
+- Firmware-image and direct-flashing evidence is summarized in
+  [Firmware research](FIRMWARE_RESEARCH.md). No 6 Max OTA image or verified controller dump has
+  been established, so encryption, signing, MCU/debug compatibility, and a safe restore path
+  remain unknown.
 
 ## Next Features
 
 Investigate and add one capability per iteration:
 
-1. Read battery percentage, estimated range, and current lock state.
-2. Add a true lock toggle backed by the validated current scooter state.
-3. Identify safe dashboard telemetry such as speed, trip, or riding mode.
-4. Add auxiliary scooter functions only after their MiOT semantics and response behavior are
-   confirmed.
-5. Evaluate porting the proven protocol to a dedicated hardware remote only after Android
+1. Supervise the new current lock-state read on the physical scooter and confirm both states.
+2. Identify safe dashboard telemetry such as speed or trip.
+3. Add auxiliary scooter functions only after their MiOT semantics and response behavior are
+  confirmed.
+4. Evaluate porting the proven protocol to a dedicated hardware remote only after Android
    functionality is stable.
 
 ## Research Rules

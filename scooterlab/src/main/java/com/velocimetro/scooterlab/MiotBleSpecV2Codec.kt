@@ -92,6 +92,18 @@ object MiotBleSpecV2Codec {
 
     private const val scooterStartingSpeedPiid = 12
 
+    /** Xiaomi Home writes the D-mode limit to control property 4.34 as UINT8. */
+    fun setScooterDriveSpeedLimit(requestId: Int, speedKmh: Int): ByteArray {
+        require(speedKmh in setOf(15, 20, 25, 32))
+        return header(requestId, 12)
+            .put(setPropertyOpcode.toByte()).put(1).put(scooterControlSiid.toByte())
+            .putShort(driveSpeedLimitPiid.toShort())
+            .putShort(((uint8ValueType shl 12) or uint8ValueLength).toShort())
+            .put(speedKmh.toByte()).array()
+    }
+
+    private const val driveSpeedLimitPiid = 34
+
     private fun header(requestId: Int, length: Int): ByteBuffer {
         require(requestId in 1..0xffff) { "MiOT request id must be a nonzero unsigned short" }
         return ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
@@ -496,6 +508,15 @@ class MiotScooterCommandComposer private constructor(
             MiotBleSpecV2Codec.setScooterStartingSpeed(requestId, speedKmh))
     }
 
+    fun beginDriveSpeedLimit(speedKmh: Int): List<ByteArray> {
+        check(state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED || state == MiotScooterCommandState.FAILED) {
+            "An application command is already in progress"
+        }
+        val requestId = requestIds.next()
+        return beginPropertyWrite(requestId, driveSpeedLimitServiceId, driveSpeedLimitPropertyId,
+            MiotBleSpecV2Codec.setScooterDriveSpeedLimit(requestId, speedKmh))
+    }
+
     private fun beginPropertyWrite(
         requestId: Int,
         serviceId: Int,
@@ -614,6 +635,8 @@ class MiotScooterCommandComposer private constructor(
         const val chargeLimitPropertyId = 21
         const val startingSpeedServiceId = 4
         const val startingSpeedPropertyId = 12
+        const val driveSpeedLimitServiceId = 4
+        const val driveSpeedLimitPropertyId = 34
     }
 }
 
@@ -744,6 +767,7 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
         val plaintext = cipher.openInbound(payload)
         val serviceId = plaintext.getOrNull(6)?.toInt()?.and(0xff)
         val propertyId = plaintext.takeIf { it.size >= 9 }?.let { readLittleEndianShort(it, 7) }
+        val lockState = extractLockState(plaintext, serviceId, propertyId)
         val metadata = MiotInboundPayloadMetadata(
             plaintextLength = plaintext.size,
             declaredLength = plaintext.takeIf { it.size >= 2 }?.let { readLittleEndianShort(it, 0) and 0x0fff },
@@ -755,8 +779,11 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
             valueTypeAndLength = plaintext.takeIf { it.size >= 11 }?.let { readLittleEndianShort(it, 9) },
             powerModeValue = extractPowerModeValue(plaintext, serviceId, propertyId),
             batteryPercentValue = extractBatteryPercentage(plaintext, serviceId, propertyId),
+            lockStateValue = lockState.value,
+            lockStateParseStatus = lockState.status,
             chargeLimitValue = extractChargeLimitValue(plaintext, serviceId, propertyId),
             startingSpeedValue = extractStartingSpeedValue(plaintext, serviceId, propertyId),
+            driveSpeedLimitValue = extractDriveSpeedLimit(plaintext, serviceId, propertyId),
             chargingStatusValue = extractChargingStatusValue(plaintext, serviceId, propertyId),
         )
         plaintext.fill(0)
@@ -781,10 +808,69 @@ data class MiotInboundPayloadMetadata(
     val valueTypeAndLength: Int?,
     val powerModeValue: Int? = null,
     val batteryPercentValue: Int? = null,
+    val lockStateValue: Boolean? = null,
+    val lockStateParseStatus: String? = null,
     val chargeLimitValue: Int? = null,
     val startingSpeedValue: Int? = null,
+    val driveSpeedLimitValue: Int? = null,
     val chargingStatusValue: Int? = null,
 )
+
+/** Extracts Xiaomi Home's `ls` lock flag from authenticated device-information JSON (2.10). */
+private data class LockStateExtraction(val value: Boolean?, val status: String?)
+
+private fun extractLockState(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): LockStateExtraction {
+    if (serviceId != MiotScooterLockStateReader.serviceId || propertyId != MiotScooterLockStateReader.propertyId) {
+        return LockStateExtraction(null, null)
+    }
+    val status = when {
+        plaintext.size < 12 -> "unexpected_length"
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size -> "length_mismatch"
+        (plaintext[4].toInt() and 0xff) !in MiotScooterLockStateReader.getPropertyResponseOperations ->
+            "unexpected_operation"
+        (plaintext[5].toInt() and 0xff) != 1 -> "unexpected_property_count"
+        readLittleEndianShort(plaintext, 9) != 0 -> "unsuccessful_result"
+        else -> null
+    }
+    if (status != null) return LockStateExtraction(null, status)
+    return when (findJsonBooleanFlag(plaintext, "ls")) {
+        false -> LockStateExtraction(false, "valid")
+        true -> LockStateExtraction(true, "valid")
+        null -> LockStateExtraction(null, "missing_or_invalid_ls")
+    }
+}
+
+/** Reads only a JSON boolean or 0/1 flag, without retaining or logging the JSON contents. */
+private fun findJsonBooleanFlag(plaintext: ByteArray, key: String): Boolean? {
+    val keyBytes = "\"$key\"".toByteArray(Charsets.UTF_8)
+    for (index in 11..(plaintext.size - keyBytes.size)) {
+        if (!keyBytes.indices.all { offset -> plaintext[index + offset] == keyBytes[offset] }) continue
+        var cursor = index + keyBytes.size
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        if (cursor >= plaintext.size || plaintext[cursor] != ':'.code.toByte()) continue
+        cursor++
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        val value = when {
+            plaintext.startsWithAscii(cursor, "true") -> true
+            plaintext.startsWithAscii(cursor, "false") -> false
+            cursor < plaintext.size && plaintext[cursor] == '0'.code.toByte() -> false
+            cursor < plaintext.size && plaintext[cursor] == '1'.code.toByte() -> true
+            else -> continue
+        }
+        cursor += if (plaintext.startsWithAscii(cursor, "true")) 4
+            else if (plaintext.startsWithAscii(cursor, "false")) 5 else 1
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        if (cursor < plaintext.size &&
+            (plaintext[cursor] == ','.code.toByte() || plaintext[cursor] == '}'.code.toByte())
+        ) return value
+    }
+    return null
+}
+
+private fun ByteArray.startsWithAscii(offset: Int, value: String): Boolean =
+    offset >= 0 && offset + value.length <= size && value.indices.all { index ->
+        this[offset + index] == value[index].code.toByte()
+    }
 
 /** Extracts a documented charge-state code from a get response or a property notification. */
 private fun extractChargingStatusValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
@@ -808,6 +894,37 @@ private fun extractStartingSpeedValue(plaintext: ByteArray, serviceId: Int?, pro
         plaintext.size != 14 || readLittleEndianShort(plaintext, 9) != 0
     ) return null
     return (plaintext.last().toInt() and 0xff).takeIf { it == 0 || it in 3..5 }
+}
+
+/** Reads only the D-mode `dg` scalar from authenticated device-information JSON (2.10). */
+private fun extractDriveSpeedLimit(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
+    if (serviceId != MiotScooterDriveSpeedLimitReader.serviceId ||
+        propertyId != MiotScooterDriveSpeedLimitReader.propertyId ||
+        plaintext.size < 15 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size
+    ) return null
+    val key = byteArrayOf('"'.code.toByte(), 'd'.code.toByte(), 'g'.code.toByte(), '"'.code.toByte())
+    for (index in 11..(plaintext.size - key.size)) {
+        if (!key.indices.all { offset -> plaintext[index + offset] == key[offset] }) continue
+        var cursor = index + key.size
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        if (cursor >= plaintext.size || plaintext[cursor] != ':'.code.toByte()) continue
+        cursor++
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        var value = 0
+        var digits = 0
+        while (cursor < plaintext.size && plaintext[cursor] in '0'.code.toByte()..'9'.code.toByte()) {
+            value = value * 10 + plaintext[cursor].toInt() - '0'.code
+            digits++
+            cursor++
+            if (value > 40) return null
+        }
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        if (digits > 0 && cursor < plaintext.size &&
+            (plaintext[cursor] == ','.code.toByte() || plaintext[cursor] == '}'.code.toByte())
+        ) return value
+    }
+    return null
 }
 
 private fun extractChargeLimitValue(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
