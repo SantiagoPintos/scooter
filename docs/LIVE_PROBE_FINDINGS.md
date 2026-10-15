@@ -69,6 +69,31 @@ the 25 km/h ceiling are:
    derives the SKU from the serial. If `ss`/`cs` are derived from the serial rather than
    stored, only a serial rewrite would change them — same after-sales path, same risk.
 
+## Dashboard-side limit computation (`handle_run_mode`)
+
+Static analysis of the dashboard firmware (sec2_MCUAPP, function `handle_run_mode` at
+VA `0x20BDB14`) established how the effective limit is produced:
+
+- The function owns the **"Device max speed standard" global**. When the KV read of the
+  standard fails, it logs `Failed to get device speed standard, using default value` and
+  **stores the default `0x19` = 25** into that global (verified instruction:
+  `movs r3, #0x19; str r3, [global]`).
+- A `movs r3, #0x19` default plus the `Device max speed standard: %d` log (which prints that
+  same global) confirm the global holds a km/h ceiling value, not an index.
+- The function contains an 18-case jump table over the run-mode state byte (`cmp #0x11; bhi`
+  + `tbh`), dispatching key/lock events per mode; each path ends in publishing
+  `d_gear.limit.rec` and logging `Update gear D max speed limit : %d in RUN_MODE`.
+- Pool strings around the switch: `Handling KEY_MODE_EVENT_PRESSED/RELEASED in RUN_MODE`,
+  `Next status is LOCK_MODE`, `Publish TOPIC_GEAR_VEHICLE_HMI`, `d_gear.limit.rec`,
+  `Gear D max speed limit: %d`.
+
+Consequence: the effective riding ceiling is produced as
+`published limit ≤ Device max speed standard (default 25)`, and the VCU additionally enforces
+its own config limit (see VCU firmware research). The standard reaches the dashboard from the
+VCU as `ss` in the device-information JSON (`ss=3` live). The open question is where the
+dashboard's standard KV is written from (dev-info `ss` parse, `CountryCode.set`, or
+SN-derived SKU) — that write path is the next analysis target.
+
 ## Safety note
 
 The diagnostic flags (`6.1`, CLI `logon`) were left enabled on the test scooter during this
