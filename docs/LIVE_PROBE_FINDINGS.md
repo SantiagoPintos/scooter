@@ -94,6 +94,38 @@ VCU as `ss` in the device-information JSON (`ss=3` live). The open question is w
 dashboard's standard KV is written from (dev-info `ss` parse, `CountryCode.set`, or
 SN-derived SKU) — that write path is the next analysis target.
 
+## VCU UART protocol (Scooter 6 plaintext) — RX side mapped
+
+The VCU's UART receive path was traced to ground the CountryCode-write risk assessment:
+
+- **Frame processor** (`0xE8BC`): tries parser A first; on failure dispatches raw frames by
+  byte[1] ∈ {`0x5A`, `0x6E`, `0x90`} through a handler table held in RAM (`0x20000030+`).
+- **Parser A** (`0x12DE4`): framing `5A 13 <cmd> <len> <payload> <crc16>` (tolerant — header
+  mismatches set flag bits instead of rejecting). The **command dispatcher** (`0x12D18`)
+  handles exactly three commands, all OTA/DFU:
+  - `cmd=2` → `0x13F8C`: start transfer — announced size must be ≤ `0x1A800` (108 KB),
+    then erases the target flash region (delays + `0x13C58`).
+  - `cmd=3` → `0x13E5C`: data chunks — per-chunk crc16, byte offset accumulated against the
+    announced total.
+  - `cmd=4` → `0x13EE4`: verify — total-length check plus **two 16-byte buffer compares**
+    (hash/signature of the received image) before accepting.
+- **Channel `0x5A`** (the app/config protocol) is handled by functions in the config
+  subsystem: `0x0800B6D5 / 0x0800B459 / 0x0800B889` — the config bitfield packers
+  (bytes 6/7/8: hardware settings), not a bulk receiver.
+- The VCU has **no AES** (no S-box in the image): the UART protocol is plaintext, unlike the
+  dashboard↔cloud/BLE layer.
+- The config lives in the VCU's internal flash (`0x08014346`/`0x080143FD` pools) with a RAM
+  mirror at `0x20003020`; a flash-write engine (unlock keys at `0xFB58`, async write/verify
+  state machine at `0xFB9C`) commits changes.
+
+Risk assessment update for a hypothetical `CountryCode.set` write (20 bytes via MiOT `7.2`):
+the VCU-side receiver is still not pinned to a specific function, but the mapped structure
+shows an async flash-write design with verification plus a main-loop consistency check that
+reverts the speed byte to 25. That lowers the outright-corruption estimate; the open risks
+remain serial-consistency (binding) and unknown validation behavior for non-serial payloads.
+The remaining unmapped area is the config function cluster at `0xC000-0xCC00` (8 functions
+touching the RAM mirror), which is the most likely location of a bulk-config receive path.
+
 ## Safety note
 
 The diagnostic flags (`6.1`, CLI `logon`) were left enabled on the test scooter during this
