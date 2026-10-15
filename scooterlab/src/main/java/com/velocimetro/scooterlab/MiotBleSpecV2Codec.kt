@@ -68,6 +68,38 @@ object MiotBleSpecV2Codec {
             .array()
     }
 
+    /** Enables or disables the dashboard's diagnostic com-log flag (MiOT 6.1, debugger service). */
+    fun setScooterComLogDebug(requestId: Int, enabled: Boolean): ByteArray {
+        val packetLength = 12
+        val typeAndLength = (boolValueType shl 12) or boolValueLength
+        return header(requestId, packetLength)
+            .put(setPropertyOpcode.toByte())
+            .put(1.toByte())
+            .put(comLogDebugServiceId.toByte())
+            .putShort(comLogDebugPropertyId.toShort())
+            .putShort(typeAndLength.toShort())
+            .put(if (enabled) 1.toByte() else 0.toByte())
+            .array()
+    }
+
+    /**
+     * Writes a ble.debug.cli command string to the dashboard's CLI property (MiOT 6.3).
+     * The dashboard's property_set_cli executes the command text. String values use the
+     * type nibble observed on live 6.3 notifications (0xA).
+     */
+    fun setScooterComLogCli(requestId: Int, command: String): ByteArray {
+        val bytes = command.toByteArray(Charsets.US_ASCII)
+        require(bytes.isNotEmpty() && bytes.size <= 64)
+        return header(requestId, 11 + bytes.size)
+            .put(setPropertyOpcode.toByte())
+            .put(1.toByte())
+            .put(comLogCliServiceId.toByte())
+            .putShort(comLogCliPropertyId.toShort())
+            .putShort(((stringValueType shl 12) or bytes.size).toShort())
+            .put(bytes)
+            .array()
+    }
+
     /** Writes the confirmed 80–100% charge target as an unsigned byte. */
     fun setScooterChargeLimit(requestId: Int, percentage: Int): ByteArray {
         require(percentage in 80..100 && percentage % 5 == 0)
@@ -79,6 +111,11 @@ object MiotBleSpecV2Codec {
     }
 
     private const val scooterChargeLimitPiid = 21
+    private const val comLogDebugServiceId = 6
+    private const val comLogDebugPropertyId = 1
+    private const val stringValueType = 0xA
+    private const val comLogCliServiceId = 6
+    private const val comLogCliPropertyId = 3
 
     /** Writes only Xiaomi's published 3–5 km/h starting-speed range. */
     fun setScooterStartingSpeed(requestId: Int, speedKmh: Int): ByteArray {
@@ -517,6 +554,24 @@ class MiotScooterCommandComposer private constructor(
             MiotBleSpecV2Codec.setScooterDriveSpeedLimit(requestId, speedKmh))
     }
 
+    fun beginComLogDebug(enabled: Boolean): List<ByteArray> {
+        check(state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED || state == MiotScooterCommandState.FAILED) {
+            "An application command is already in progress"
+        }
+        val requestId = requestIds.next()
+        return beginPropertyWrite(requestId, comLogDebugServiceId, comLogDebugPropertyId,
+            MiotBleSpecV2Codec.setScooterComLogDebug(requestId, enabled))
+    }
+
+    fun beginComLogCli(command: String): List<ByteArray> {
+        check(state == MiotScooterCommandState.IDLE || state == MiotScooterCommandState.COMPLETED || state == MiotScooterCommandState.FAILED) {
+            "An application command is already in progress"
+        }
+        val requestId = requestIds.next()
+        return beginPropertyWrite(requestId, comLogCliServiceId, comLogCliPropertyId,
+            MiotBleSpecV2Codec.setScooterComLogCli(requestId, command))
+    }
+
     private fun beginPropertyWrite(
         requestId: Int,
         serviceId: Int,
@@ -631,6 +686,10 @@ class MiotScooterCommandComposer private constructor(
         const val propertyCount = 1
         const val lockServiceId = 4
         const val lockPropertyId = 6
+        const val comLogDebugServiceId = 6
+        const val comLogDebugPropertyId = 1
+        const val comLogCliServiceId = 6
+        const val comLogCliPropertyId = 3
         const val chargeLimitServiceId = 4
         const val chargeLimitPropertyId = 21
         const val startingSpeedServiceId = 4
@@ -786,6 +845,12 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
             driveSpeedLimitValue = extractDriveSpeedLimit(plaintext, serviceId, propertyId),
             chargingStatusValue = extractChargingStatusValue(plaintext, serviceId, propertyId),
             countryCodeValue = extractCountryCode(plaintext, serviceId, propertyId),
+            ecuRegionToken = extractEcuRegionToken(plaintext, serviceId, propertyId),
+            ecuReplyStructure = extractEcuReplyStructure(plaintext, serviceId, propertyId),
+            deviceInfoKeys = extractDeviceInfoKeys(plaintext, serviceId, propertyId),
+            deviceInfoScalars = extractDeviceInfoScalars(plaintext, serviceId, propertyId),
+            comLogText = extractComLogText(plaintext, serviceId, propertyId),
+            comLogStreamText = extractComLogStreamText(plaintext, serviceId, propertyId),
         )
         plaintext.fill(0)
         metadata
@@ -816,6 +881,12 @@ data class MiotInboundPayloadMetadata(
     val driveSpeedLimitValue: Int? = null,
     val chargingStatusValue: Int? = null,
     val countryCodeValue: Int? = null,
+    val ecuRegionToken: String? = null,
+    val ecuReplyStructure: String? = null,
+    val deviceInfoKeys: List<String>? = null,
+    val deviceInfoScalars: Map<String, Int>? = null,
+    val comLogText: String? = null,
+    val comLogStreamText: String? = null,
 )
 
 /** Extracts Xiaomi Home's `ls` lock flag from authenticated device-information JSON (2.10). */
@@ -949,6 +1020,190 @@ private fun extractCountryCode(plaintext: ByteArray, serviceId: Int?, propertyId
         plaintext.size < 14
     ) return null
     return (plaintext.last().toInt() and 0xff).takeIf { it in 0..255 }
+}
+
+/**
+ * Extracts the VCU region token (for example `BU1`) from the after-sales ECU SN reply
+ * (MiOT `7.2`), whose dashboard getter publishes `CountryCode.get.vcu.comm`. The reply is a
+ * string that also carries the ECU serial number; only tokens matching two uppercase ASCII
+ * letters followed by a digit are surfaced, and the serial itself is never retained.
+ */
+private fun extractEcuRegionToken(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): String? {
+    if (serviceId != MiotScooterCountryCodeReader.serviceId ||
+        propertyId != MiotScooterCountryCodeReader.propertyId ||
+        plaintext.size < 14 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size ||
+        (plaintext[4].toInt() and 0xff) !in setOf(1, 3) ||
+        (plaintext[5].toInt() and 0xff) != 1 ||
+        readLittleEndianShort(plaintext, 9) != 0
+    ) return null
+    val tokens = mutableListOf<String>()
+    var index = 11
+    while (index + 2 < plaintext.size) {
+        val a = plaintext[index].toInt()
+        val b = plaintext[index + 1].toInt()
+        val c = plaintext[index + 2].toInt()
+        if (a in 'A'.code..'Z'.code && b in 'A'.code..'Z'.code && c in '0'.code..'9'.code) {
+            val token = plaintext.decodeToString(index, index + 3)
+            if (token !in tokens) tokens.add(token)
+        }
+        index++
+    }
+    return tokens.takeIf { it.isNotEmpty() }?.joinToString("/")
+}
+
+/**
+ * Structural, value-free map of the ECU SN reply bytes (offset 11 onward): `A` uppercase
+ * letter, `a` lowercase letter, `0` digit, `.` other printable, `x` non-printable. This
+ * exposes the reply's layout without exposing the serial number or any payload value.
+ */
+private fun extractEcuReplyStructure(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): String? {
+    if (serviceId != MiotScooterCountryCodeReader.serviceId ||
+        propertyId != MiotScooterCountryCodeReader.propertyId ||
+        plaintext.size < 14 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size ||
+        (plaintext[4].toInt() and 0xff) !in setOf(1, 3) ||
+        (plaintext[5].toInt() and 0xff) != 1
+    ) return null
+    return buildString {
+        for (index in 11 until plaintext.size) {
+            val b = plaintext[index].toInt() and 0xff
+            append(
+                when {
+                    b in 'A'.code..'Z'.code -> 'A'
+                    b in 'a'.code..'z'.code -> 'a'
+                    b in '0'.code..'9'.code -> '0'
+                    b in 0x20..0x7e -> '.'
+                    else -> 'x'
+                },
+            )
+        }
+    }
+}
+
+/**
+ * Structural metadata only: the KEY NAMES present in the device-information JSON (2.10).
+ * Values are never surfaced here; key names are structural metadata needed to map the
+ * device-information schema, and the plaintext buffer is wiped by the consumer afterwards.
+ */
+private fun extractDeviceInfoKeys(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): List<String>? {
+    if (serviceId != MiotScooterDriveSpeedLimitReader.serviceId ||
+        propertyId != MiotScooterDriveSpeedLimitReader.propertyId ||
+        plaintext.size < 15 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size
+    ) return null
+    val keys = mutableListOf<String>()
+    var index = 11
+    while (index < plaintext.size) {
+        if (plaintext[index] != '"'.code.toByte()) {
+            index++
+            continue
+        }
+        var end = index + 1
+        while (end < plaintext.size && plaintext[end] != '"'.code.toByte() &&
+            plaintext[end].toInt().toChar().isLetterOrDigit()
+        ) end++
+        if (end >= plaintext.size || plaintext[end] != '"'.code.toByte() ||
+            end == index + 1 || end - index > 13
+        ) {
+            index++
+            continue
+        }
+        var cursor = end + 1
+        while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+        if (cursor < plaintext.size && plaintext[cursor] == ':'.code.toByte()) {
+            val key = plaintext.decodeToString(index + 1, end)
+            if (key !in keys) keys.add(key)
+        }
+        index = end + 1
+    }
+    return keys.takeIf { it.isNotEmpty() }
+}
+
+/** Scalar keys worth surfacing from device-information JSON: speed standard, country, VCU speed. */
+private val DEVICE_INFO_SCALAR_KEYS = listOf("ss", "cs", "vs")
+
+/**
+ * Reads ONLY the whitelisted scalar keys from device-information JSON (2.10). These are
+ * telemetry-class scalars (speed standard, country setting, VCU speed); identifying fields
+ * such as serial keys are never surfaced.
+ */
+private fun extractDeviceInfoScalars(
+    plaintext: ByteArray,
+    serviceId: Int?,
+    propertyId: Int?,
+): Map<String, Int>? {
+    if (serviceId != MiotScooterDriveSpeedLimitReader.serviceId ||
+        propertyId != MiotScooterDriveSpeedLimitReader.propertyId ||
+        plaintext.size < 15 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size
+    ) return null
+    val values = mutableMapOf<String, Int>()
+    for (key in DEVICE_INFO_SCALAR_KEYS) {
+        val keyBytes = "\"$key\"".toByteArray(Charsets.UTF_8)
+        var index = 11
+        while (index + keyBytes.size < plaintext.size) {
+            if (!keyBytes.indices.all { offset -> plaintext[index + offset] == keyBytes[offset] }) {
+                index++
+                continue
+            }
+            var cursor = index + keyBytes.size
+            while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+            if (cursor >= plaintext.size || plaintext[cursor] != ':'.code.toByte()) {
+                index++
+                continue
+            }
+            cursor++
+            while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+            var value = 0
+            var digits = 0
+            while (cursor < plaintext.size && plaintext[cursor] in '0'.code.toByte()..'9'.code.toByte()) {
+                value = value * 10 + plaintext[cursor].toInt() - '0'.code
+                digits++
+                cursor++
+                if (value > 999) break
+            }
+            while (cursor < plaintext.size && plaintext[cursor].toInt().toChar().isWhitespace()) cursor++
+            if (digits > 0 && value <= 999 && cursor < plaintext.size &&
+                (plaintext[cursor] == ','.code.toByte() || plaintext[cursor] == '}'.code.toByte())
+            ) {
+                values[key] = value
+                break
+            }
+            index++
+        }
+    }
+    return values.takeIf { it.isNotEmpty() }
+}
+
+/**
+ * Raw diagnostic com-log text (MiOT `6.2`). Handled in memory only; the caller must filter
+ * before display and must never log it. Only successful, single-property string replies are
+ * surfaced.
+ */
+private fun extractComLogText(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): String? {
+    if (serviceId != MiotScooterComLogReader.serviceId ||
+        propertyId != MiotScooterComLogReader.propertyId ||
+        plaintext.size < 12 ||
+        (readLittleEndianShort(plaintext, 0) and 0x0fff) != plaintext.size ||
+        (plaintext[4].toInt() and 0xff) !in setOf(1, 3) ||
+        (plaintext[5].toInt() and 0xff) != 1
+    ) return null
+    return plaintext.decodeToString(11, plaintext.size)
+}
+
+/**
+ * Captures streaming com-log notifications (operation 4) from the debugger properties
+ * (6.2 com-log and 6.3 com-log-point). Handled in memory only; the caller must filter
+ * before display and must never log the text.
+ */
+private fun extractComLogStreamText(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): String? {
+    if (serviceId != MiotScooterComLogReader.serviceId ||
+        propertyId !in listOf(MiotScooterComLogReader.propertyId, 3) ||
+        plaintext.size < 12 ||
+        (plaintext[4].toInt() and 0xff) != 4
+    ) return null
+    return plaintext.decodeToString(11, plaintext.size)
 }
 
 /**

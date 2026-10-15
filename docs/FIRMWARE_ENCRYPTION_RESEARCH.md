@@ -186,4 +186,6 @@ the dashboard's property handlers.
 - [VCU firmware research](VCU_FIRMWARE_RESEARCH.md) — analysis of a plaintext VCU image from the
   same product family, exposing the controller-side speed-limit logic that the encrypted 6 Max
   packages hide.
+- [Live probe findings](LIVE_PROBE_FINDINGS.md) — verified diagnostic surface (debugger service,
+  com-log stream, after-sales SN read) and the live device-information schema of the test scooter.
 - `bw-patcher/scripts/analyze_scooter6max_mcu.py` — reproducible structural/ECB analysis.

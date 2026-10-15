@@ -1,17 +1,19 @@
 package com.velocimetro.scooterlab
 
 /**
- * Reader for the device's CountryCode (region) property.
+ * Read-only probe for the VCU region code via the after-sales ECU SN property.
  *
- * This reader is a diagnostic tool to identify the VCU's configured region, which is
- * a primary hypothesis for the whole-scooter speed ceiling that cannot be explained by
- * the drive-mode limit (4.34).
+ * The dashboard firmware property table (sec2_MCUAPP.bin) maps MiOT `7.2` (ecu-sn) to
+ * getter/setter functions whose code publishes the `CountryCode.get.vcu.comm` /
+ * `CountryCode.set.vcu.comm` UART topics. A GET on `7.2` therefore makes the dashboard ask
+ * the VCU for its region and return the reply string. The Scooter 6 VCU research documents
+ * region tokens shaped like `EU1`/`BU1`/`EU2`.
  *
- * Protocol mapping derived from dashboard firmware (sec2_MCUAPP.bin):
- * - UART topic "CountryCode.get.vcu.comm" (handler 0x020DDA55, see FIRMWARE_ENCRYPTION_RESEARCH.md).
- * - The property ID is provisionally assigned as the next VCU comm property (11),
- *   following the pattern of driveSpeedLimit (2.10). It must be verified against live traffic
- *   before being treated as confirmed.
+ * Extraction exposes ONLY the region token. The ECU serial number itself is never returned,
+ * logged, or retained by this reader; the reply bytes are wiped by the codec consumer after
+ * extraction. The `7.2` mapping is derived from the firmware table and requires live
+ * verification; a silent or refused property is reported as unavailable, never retried
+ * automatically.
  */
 class MiotScooterCountryCodeReader(
     private val requestIds: MiotBleSpecRequestCounter,
@@ -20,6 +22,8 @@ class MiotScooterCountryCodeReader(
     enum class State { IDLE, WAITING_FLOW_ACK, WAITING_RESPONSE, COMPLETED, FAILED }
 
     var state = State.IDLE
+        private set
+    var replyStructure: String? = null
         private set
     private var pendingRequestId: Int? = null
     private var pendingDataFrames: List<ByteArray> = emptyList()
@@ -60,18 +64,18 @@ class MiotScooterCountryCodeReader(
         return pendingDataFrames
     }
 
-    fun onInboundResponse(metadata: MiotInboundPayloadMetadata): Int? {
+    fun onInboundResponse(metadata: MiotInboundPayloadMetadata): String? {
         if (state != State.WAITING_RESPONSE ||
             metadata.requestId != pendingRequestId ||
             metadata.operation !in setOf(1, 3) ||
             metadata.propertyCount != 1 ||
             metadata.serviceId != serviceId || metadata.propertyId != propertyId
         ) return null
-        val countryCode = metadata.countryCodeValue ?: return null
+        replyStructure = metadata.ecuReplyStructure
         pendingDataFrames = emptyList()
         pendingRequestId = null
         state = State.COMPLETED
-        return countryCode
+        return metadata.ecuRegionToken
     }
 
     fun cancel() {
@@ -81,9 +85,7 @@ class MiotScooterCountryCodeReader(
     }
 
     companion object {
-        // Provisional MiOT property IDs for the VCU CountryCode, mirroring 2.10 structure.
-        // Requires verification against live BLE traffic from Xiaomi Home or VCU response.
-        const val serviceId = 2
-        const val propertyId = 11
+        const val serviceId = 7
+        const val propertyId = 2
     }
 }

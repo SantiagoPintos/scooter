@@ -155,15 +155,46 @@ class MiotBleSpecV2CodecTest {
     }
 
     @Test
-    fun countryCodeReadAcceptsOnlyMatchingProvisionalProperty() {
+    fun ecuRegionProbeAcceptsOnlyMatchingAfterSalesProperty() {
         val reader = MiotScooterCountryCodeReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64)))
         reader.begin()
         reader.advanceWithoutFlowAcknowledgement()
         assertEquals(null, reader.onInboundResponse(
-            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 10, 0, countryCodeValue = 7)))
-        assertEquals(7, reader.onInboundResponse(
-            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 11, 0, countryCodeValue = 7)))
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 10, 0, ecuRegionToken = "BU1")))
+        assertEquals("BU1", reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 7, 2, 0, ecuRegionToken = "BU1")))
         assertEquals(MiotScooterCountryCodeReader.State.COMPLETED, reader.state)
+
+        val structuralReader = MiotScooterCountryCodeReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64)))
+        structuralReader.begin()
+        structuralReader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, structuralReader.onInboundResponse(
+            MiotInboundPayloadMetadata(31, 31, 2, 3, 1, 7, 2, 0, ecuReplyStructure = "00000000000000000000")))
+        assertEquals(MiotScooterCountryCodeReader.State.COMPLETED, structuralReader.state)
+        assertEquals("00000000000000000000", structuralReader.replyStructure)
+    }
+
+    @Test
+    fun ecuRegionExtractorRetainsOnlyRegionToken() {
+        val receiverSession = ByteArray(64) { (it + 41).toByte() }
+        val senderSession = ByteArray(64)
+        receiverSession.copyInto(senderSession, destinationOffset = 16, startIndex = 0, endIndex = 16)
+        receiverSession.copyInto(senderSession, destinationOffset = 36, startIndex = 32, endIndex = 36)
+        fun readToken(value: String): String? {
+            val bytes = value.toByteArray()
+            val length = 11 + bytes.size
+            val plaintext = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((0x2000 or length).toShort()).putShort(2).put(3).put(1)
+                .put(7).putShort(2).putShort(0).put(bytes).array()
+            return MiotScooterInboundResponseConsumer(MiotBleApplicationCipher(receiverSession))
+                .consume(MiotBleApplicationCipher(senderSession).sealOutbound(plaintext))?.ecuRegionToken
+        }
+        // Reply carries SN-adjacent data plus the region token; only the token is exposed.
+        assertEquals("BU1", readToken("1234567890123456BU1"))
+        // A reply without a region-shaped token exposes nothing.
+        assertEquals(null, readToken("1234567890123456"))
+        // Lowercase look-alikes are not region tokens.
+        assertEquals(null, readToken("12ab1"))
     }
 
     @Test

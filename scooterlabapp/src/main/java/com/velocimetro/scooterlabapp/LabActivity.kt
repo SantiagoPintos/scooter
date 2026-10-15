@@ -34,6 +34,8 @@ import com.velocimetro.scooterlab.MiotScooterBatteryReadState
 import com.velocimetro.scooterlab.MiotScooterPowerModeReader
 import com.velocimetro.scooterlab.MiotScooterPowerModeReadState
 import com.velocimetro.scooterlab.MiotScooterChargeLimitReader
+import com.velocimetro.scooterlab.MiotScooterComLogReader
+import com.velocimetro.scooterlab.MiotScooterCountryCodeReader
 import com.velocimetro.scooterlab.MiotScooterStartingSpeedReader
 import com.velocimetro.scooterlab.MiotScooterDriveSpeedLimitReader
 import com.velocimetro.scooterlab.MiotScooterChargingStatusReader
@@ -74,6 +76,9 @@ class LabActivity : Activity() {
     private lateinit var startingSpeedValue: TextView
     private lateinit var startingSpeedButton: Button
     private lateinit var driveSpeedLimitValue: TextView
+    private lateinit var countryCodeValue: TextView
+    private lateinit var countryCodeButton: Button
+    private lateinit var comLogValue: TextView
     private lateinit var driveSpeedLimitButton: Button
     private lateinit var dashboardContent: LinearLayout
     private lateinit var settingsContent: LinearLayout
@@ -94,6 +99,8 @@ class LabActivity : Activity() {
     private var chargeLimitReader: MiotScooterChargeLimitReader? = null
     private var startingSpeedReader: MiotScooterStartingSpeedReader? = null
     private var driveSpeedLimitReader: MiotScooterDriveSpeedLimitReader? = null
+    private var countryCodeReader: MiotScooterCountryCodeReader? = null
+    private var comLogReader: MiotScooterComLogReader? = null
     private var chargingStatusReader: MiotScooterChargingStatusReader? = null
     private var applicationInitializer: MiotScooterApplicationInitializer? = null
     private var inboundResponseConsumer: MiotScooterInboundResponseConsumer? = null
@@ -109,8 +116,11 @@ class LabActivity : Activity() {
     private var pendingStartingVerification: Int? = null
     private var lastKnownStartingSpeed: Int? = null
     private var pendingDriveSpeedLimit: Int? = null
+    private var pendingComLogDebug: Boolean? = null
+    private var pendingComLogCli: String? = null
     private var pendingDriveSpeedVerification: Int? = null
     private var lastKnownDriveSpeedLimit: Int? = null
+    private var deviceInfoKeysLogged = false
     private var lastKnownLockState: Boolean? = null
     private var lastKnownBatteryPercentage: Int? = null
     private var lastKnownPowerMode: Int? = null
@@ -129,6 +139,8 @@ class LabActivity : Activity() {
     private val chargeLimitReadHandler = Handler(Looper.getMainLooper())
     private val startingSpeedReadHandler = Handler(Looper.getMainLooper())
     private val driveSpeedReadHandler = Handler(Looper.getMainLooper())
+    private val countryCodeReadHandler = Handler(Looper.getMainLooper())
+    private val comLogReadHandler = Handler(Looper.getMainLooper())
     private val chargingReadHandler = Handler(Looper.getMainLooper())
     private val chargingPollRunnable = Runnable { requestChargingStatus() }
     private val automaticConnectionHandler = Handler(Looper.getMainLooper())
@@ -203,6 +215,17 @@ class LabActivity : Activity() {
         lastKnownDriveSpeedLimit = null
         restoreControlsAfterChargingRead()
         scheduleChargingStatusRead()
+    }
+    private val countryCodeReadTimeoutRunnable = Runnable {
+        countryCodeReader?.cancel()
+        countryCodeValue.text = "Region code unavailable"
+        Log.i(logTag, "Country-code read timed out for the provisional MiOT property.")
+        scheduleChargingStatusRead()
+    }
+    private val comLogReadTimeoutRunnable = Runnable {
+        comLogReader?.cancel()
+        comLogValue.text = "Diagnostic log unavailable"
+        Log.i(logTag, "Com-log read timed out for MiOT property 6.2.")
     }
     private val chargingReadTimeoutRunnable = Runnable {
         chargingStatusReader?.cancel()
@@ -292,6 +315,8 @@ class LabActivity : Activity() {
         chargeLimitReadHandler.removeCallbacksAndMessages(null)
         startingSpeedReadHandler.removeCallbacksAndMessages(null)
         driveSpeedReadHandler.removeCallbacksAndMessages(null)
+        countryCodeReadHandler.removeCallbacksAndMessages(null)
+        comLogReadHandler.removeCallbacksAndMessages(null)
         chargingReadHandler.removeCallbacksAndMessages(null)
         automaticConnectionHandler.removeCallbacksAndMessages(null)
         commandComposer?.clear()
@@ -301,6 +326,8 @@ class LabActivity : Activity() {
         chargeLimitReader?.cancel()
         startingSpeedReader?.cancel()
         driveSpeedLimitReader?.cancel()
+        countryCodeReader?.cancel()
+        comLogReader?.cancel()
         chargingStatusReader?.cancel()
         applicationInitializer = null
         batteryReader = null
@@ -309,6 +336,8 @@ class LabActivity : Activity() {
         chargeLimitReader = null
         startingSpeedReader = null
         driveSpeedLimitReader = null
+        countryCodeReader = null
+        comLogReader = null
         chargingStatusReader = null
         inboundResponseConsumer = null
         applicationChannel?.clear()
@@ -349,6 +378,8 @@ class LabActivity : Activity() {
                     addView(startingSpeedCard())
                     addView(spacer(16))
                     addView(driveSpeedLimitCard())
+                    addView(spacer(16))
+                    addView(countryCodeCard())
                     addView(spacer(16))
                     startButton = Button(this@LabActivity).apply {
                         text = "Reconnect scooter"
@@ -746,6 +777,90 @@ class LabActivity : Activity() {
         addView(driveSpeedLimitButton)
     }
 
+    private fun countryCodeCard(): LinearLayout = card().apply {
+        addView(TextView(this@LabActivity).apply {
+            text = "REGION CODE · DIAGNOSTIC"
+            setTextColor(mutedTextColor)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        countryCodeValue = TextView(this@LabActivity).apply {
+            text = "Connect to read region code"
+            setTextColor(primaryTextColor)
+            textSize = 18f
+            setPadding(0, dp(10), 0, dp(12))
+        }
+        addView(countryCodeValue)
+        countryCodeButton = Button(this@LabActivity).apply {
+            text = "Read region code"
+            isAllCaps = false
+            setOnClickListener { requestRegionProbe() }
+        }
+        addView(countryCodeButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
+        addView(TextView(this@LabActivity).apply {
+            text = "Read-only probe of the after-sales ECU property (7.2). The reply is parsed " +
+                "on the scooter side; only a region token is shown."
+            setTextColor(mutedTextColor)
+            textSize = 12f
+            setPadding(0, dp(4), 0, 0)
+        })
+        comLogValue = TextView(this@LabActivity).apply {
+            text = ""
+            setTextColor(secondaryTextColor)
+            textSize = 11f
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        addView(comLogValue)
+        addView(Button(this@LabActivity).apply {
+            text = "Read diagnostic log"
+            isAllCaps = false
+            setOnClickListener { requestComLog() }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
+        addView(Button(this@LabActivity).apply {
+            text = "Enable diagnostic logging"
+            isAllCaps = false
+            setOnClickListener {
+                AlertDialog.Builder(this@LabActivity)
+                    .setTitle("Activar log de diagnóstico")
+                    .setMessage(
+                        "Escribe la propiedad 6.1 (com-log-debug) = true. Es una flag de " +
+                            "diagnóstico reversible del spec del producto; después se lee con " +
+                            "'Read diagnostic log'. ¿Confirmás?",
+                    )
+                    .setNegativeButton("Cancelar", null)
+                    .setPositiveButton("Confirmar") { _, _ -> beginComLogDebugChange(true) }
+                    .show()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
+        addView(Button(this@LabActivity).apply {
+            text = "Send CLI: logon"
+            isAllCaps = false
+            setOnClickListener {
+                AlertDialog.Builder(this@LabActivity)
+                    .setTitle("Enviar comando CLI: logon")
+                    .setMessage(
+                        "Escribe 'logon' en la propiedad 6.3 (property_set_cli del dashboard) " +
+                            "para activar el stream de logs internos. ¿Confirmás?",
+                    )
+                    .setNegativeButton("Cancelar", null)
+                    .setPositiveButton("Confirmar") { _, _ -> beginComLogCliChange("logon") }
+                    .show()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
+    }
+
     private fun showDashboard() {
         dashboardContent.visibility = View.VISIBLE
         settingsContent.visibility = View.GONE
@@ -952,6 +1067,7 @@ class LabActivity : Activity() {
             chargeLimitValue.text = "Reading charge limit…"
             startingSpeedValue.text = "Reading starting speed…"
             driveSpeedLimitValue.text = "Reading Drive limit…"
+            countryCodeValue.text = "Use the button below to read the region code"
             renderDashboardTelemetry()
             renderChargingStatus()
             // Xiaomi Home restarts this counter on every authenticated BLE session. Its first
@@ -967,6 +1083,8 @@ class LabActivity : Activity() {
             chargeLimitReader = MiotScooterChargeLimitReader(requestIds, cipher)
             startingSpeedReader = MiotScooterStartingSpeedReader(requestIds, cipher)
             driveSpeedLimitReader = MiotScooterDriveSpeedLimitReader(requestIds, cipher)
+            countryCodeReader = MiotScooterCountryCodeReader(requestIds, cipher)
+            comLogReader = MiotScooterComLogReader(requestIds, cipher)
             chargingStatusReader = MiotScooterChargingStatusReader(requestIds, cipher)
             applicationInitializer = MiotScooterApplicationInitializer(requestIds, cipher)
             inboundResponseConsumer = MiotScooterInboundResponseConsumer(cipher)
@@ -1308,8 +1426,204 @@ class LabActivity : Activity() {
             }
         }
         Log.i(logTag, "Drive-limit read completed from device information.")
+        if (!deviceInfoKeysLogged) {
+            metadata.deviceInfoKeys?.takeIf { it.isNotEmpty() }?.let { keys ->
+                deviceInfoKeysLogged = true
+                Log.i(logTag, "Device-info key names: ${keys.joinToString(",")}")
+            }
+            metadata.deviceInfoScalars?.let { scalars ->
+                Log.i(logTag, "Device-info scalars: $scalars")
+            }
+        }
         setControlsEnabled(true)
         scheduleChargingStatusRead()
+    }
+
+    private fun requestCountryCode() {
+        val reader = countryCodeReader ?: return
+        val currentSession = session ?: return
+        if (reader.state == MiotScooterCountryCodeReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterCountryCodeReader.State.WAITING_RESPONSE
+        ) return
+        try {
+            currentSession.writeApplicationFrames(reader.begin())
+            countryCodeReadHandler.removeCallbacksAndMessages(null)
+            countryCodeReadHandler.postDelayed({
+                if (countryCodeReader !== reader ||
+                    reader.state != MiotScooterCountryCodeReader.State.WAITING_FLOW_ACK
+                ) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            countryCodeReadHandler.postDelayed(countryCodeReadTimeoutRunnable, batteryReadTimeoutMillis)
+        } catch (_: Exception) {
+            reader.cancel()
+            countryCodeValue.text = "Region code unavailable"
+        }
+    }
+
+    private fun consumeCountryCodeResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        val reader = countryCodeReader ?: return
+        if (reader.state != MiotScooterCountryCodeReader.State.WAITING_RESPONSE) return
+        val token = reader.onInboundResponse(metadata)
+        if (reader.state != MiotScooterCountryCodeReader.State.COMPLETED) return
+        countryCodeReadHandler.removeCallbacksAndMessages(null)
+        countryCodeValue.text = when {
+            token != null -> "Region token: $token · structure: ${reader.replyStructure ?: "unknown"}"
+            else -> "Reply structure: ${reader.replyStructure ?: "unknown"}"
+        }
+        Log.i(logTag, "Region-code probe completed via the after-sales ECU property.")
+    }
+
+    private fun requestRegionProbe() {
+        val reader = countryCodeReader
+        if (reader == null || session == null) {
+            countryCodeValue.text = "Connect to the scooter first"
+            return
+        }
+        if (reader.state == MiotScooterCountryCodeReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterCountryCodeReader.State.WAITING_RESPONSE
+        ) return
+        countryCodeValue.text = "Reading region code…"
+        requestCountryCode()
+    }
+
+    private fun requestComLog() {
+        val reader = comLogReader
+        if (reader == null || session == null) {
+            comLogValue.text = "Connect to the scooter first"
+            return
+        }
+        if (reader.state == MiotScooterComLogReader.State.WAITING_FLOW_ACK ||
+            reader.state == MiotScooterComLogReader.State.WAITING_RESPONSE
+        ) return
+        try {
+            val currentSession = session ?: return
+            currentSession.writeApplicationFrames(reader.begin())
+            comLogReadHandler.removeCallbacksAndMessages(null)
+            comLogReadHandler.postDelayed({
+                if (comLogReader !== reader ||
+                    reader.state != MiotScooterComLogReader.State.WAITING_FLOW_ACK
+                ) return@postDelayed
+                try {
+                    reader.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { reader.cancel() }
+            }, observedFlowWindowMillis)
+            comLogReadHandler.postDelayed(comLogReadTimeoutRunnable, batteryReadTimeoutMillis)
+        } catch (_: Exception) {
+            reader.cancel()
+            comLogValue.text = "Diagnostic log unavailable"
+        }
+    }
+
+    private fun beginComLogDebugChange(enabled: Boolean) {
+        val composer = commandComposer ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
+            composer.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
+        ) return
+        try {
+            val frames = composer.beginComLogDebug(enabled)
+            pendingComLogDebug = enabled
+            setControlsEnabled(false)
+            comLogValue.text = if (enabled) "Enabling diagnostic logging…" else "Disabling diagnostic logging…"
+            currentSession.writeApplicationFrames(frames)
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            commandTimeoutHandler.postDelayed({
+                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    composer.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { composer.abort() }
+            }, observedFlowWindowMillis)
+            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
+        } catch (_: Exception) {
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            composer.abort()
+            pendingComLogDebug = null
+            setControlsEnabled(true)
+            showFailure("No se pudo cambiar el log de diagnóstico.")
+        }
+    }
+
+    private fun beginComLogCliChange(command: String) {
+        val composer = commandComposer ?: return
+        val currentSession = session ?: return
+        if (applicationChannel?.state != ScooterApplicationChannelState.READY ||
+            composer.state in setOf(MiotScooterCommandState.WAITING_FLOW_ACK,
+                MiotScooterCommandState.WAITING_DATA_ACK, MiotScooterCommandState.WAITING_RESPONSE)
+        ) return
+        try {
+            val frames = composer.beginComLogCli(command)
+            pendingComLogCli = command
+            setControlsEnabled(false)
+            comLogValue.text = "Sending CLI '$command'…"
+            currentSession.writeApplicationFrames(frames)
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            commandTimeoutHandler.postDelayed({
+                if (composer.state != MiotScooterCommandState.WAITING_FLOW_ACK) return@postDelayed
+                try {
+                    composer.advanceWithoutFlowAcknowledgement().takeIf { it.isNotEmpty() }?.let {
+                        currentSession.writeApplicationFrames(it)
+                    }
+                } catch (_: Exception) { composer.abort() }
+            }, observedFlowWindowMillis)
+            commandTimeoutHandler.postDelayed(commandTimeoutRunnable, commandTimeoutMillis)
+        } catch (_: Exception) {
+            commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+            composer.abort()
+            pendingComLogCli = null
+            setControlsEnabled(true)
+            showFailure("No se pudo enviar el comando CLI.")
+        }
+    }
+
+    private fun consumeComLogResponse(metadata: com.velocimetro.scooterlab.MiotInboundPayloadMetadata) {
+        if (metadata.operation == 4 && metadata.serviceId == MiotScooterComLogReader.serviceId) {
+            metadata.comLogStreamText?.takeIf { it.isNotEmpty() }?.let {
+                comLogStreamBuffer.append(it)
+                if (comLogStreamBuffer.length > 16000) {
+                    comLogStreamBuffer.delete(0, comLogStreamBuffer.length - 10000)
+                }
+                updateComLogPreview()
+            }
+            return
+        }
+        val reader = comLogReader ?: return
+        if (reader.state != MiotScooterComLogReader.State.WAITING_RESPONSE) return
+        val text = reader.onInboundResponse(metadata) ?: return
+        comLogReadHandler.removeCallbacksAndMessages(null)
+        comLogStreamBuffer.append(text)
+        updateComLogPreview()
+    }
+
+    private fun updateComLogPreview() {
+        val text = comLogStreamBuffer.toString()
+        val lines = text.split('\n', '\r').map { it.trim() }.filter { it.isNotEmpty() }
+        val keywords = listOf("speed", "standard", "country", "code", "gear", "limit", "vcu")
+        val matching = lines.filter { line -> keywords.any { line.lowercase().contains(it) } }
+        Log.i(logTag, "Com-log stream: ${text.length} chars buffered, ${lines.size} lines, ${matching.size} matching.")
+        if (matching.isNotEmpty()) {
+            Log.i(
+                logTag,
+                "Com-log matched lines (masked):\n" +
+                    matching.take(80).joinToString("\n") { it.replace(Regex("\\d{5,}"), "***") },
+            )
+        }
+        comLogValue.text = if (matching.isEmpty()) {
+            if (text.isEmpty()) "" else "Stream: ${lines.size} lines, no speed/country lines matched."
+        } else {
+            matching.take(80)
+                .joinToString("\n") { it.replace(Regex("\\d{5,}"), "***") }
+                .take(2600)
+        }
     }
 
     private fun scheduleChargingStatusRead(delayMillis: Long = chargingPollIntervalMillis) {
@@ -1340,6 +1654,10 @@ class LabActivity : Activity() {
                 MiotScooterStartingSpeedReader.State.WAITING_RESPONSE) ||
             driveSpeedLimitReader?.state in setOf(MiotScooterDriveSpeedLimitReader.State.WAITING_FLOW_ACK,
                 MiotScooterDriveSpeedLimitReader.State.WAITING_RESPONSE) ||
+            countryCodeReader?.state in setOf(MiotScooterCountryCodeReader.State.WAITING_FLOW_ACK,
+                MiotScooterCountryCodeReader.State.WAITING_RESPONSE) ||
+            comLogReader?.state in setOf(MiotScooterComLogReader.State.WAITING_FLOW_ACK,
+                MiotScooterComLogReader.State.WAITING_RESPONSE) ||
             pendingDriveSpeedVerification != null
         ) {
             scheduleChargingStatusRead(chargingBusyRetryMillis)
@@ -1730,6 +2048,8 @@ class LabActivity : Activity() {
                             consumeChargeLimitResponse(metadata)
                             consumeStartingSpeedResponse(metadata)
                             consumeDriveSpeedLimitResponse(metadata)
+                            consumeCountryCodeResponse(metadata)
+                            consumeComLogResponse(metadata)
                             consumeChargingStatusResponse(metadata)
                         }
                         renderCommandState(composer)
@@ -1764,6 +2084,8 @@ class LabActivity : Activity() {
                     consumeChargeLimitResponse(responseMetadata)
                     consumeStartingSpeedResponse(responseMetadata)
                     consumeDriveSpeedLimitResponse(responseMetadata)
+                    consumeCountryCodeResponse(responseMetadata)
+                    consumeComLogResponse(responseMetadata)
                     consumeChargingStatusResponse(responseMetadata)
                     renderCommandState(composer)
                 } else {
@@ -1840,6 +2162,16 @@ class LabActivity : Activity() {
                 session?.writeApplicationFrames(driveSpeedFrames)
                     ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
             }
+            val countryCodeFrames = countryCodeReader?.onApplicationFrame(frame).orEmpty()
+            if (countryCodeFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(countryCodeFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
+            val comLogFrames = comLogReader?.onApplicationFrame(frame).orEmpty()
+            if (comLogFrames.isNotEmpty()) {
+                session?.writeApplicationFrames(comLogFrames)
+                    ?: throw IllegalStateException("La conexión Bluetooth ya no está disponible")
+            }
             val chargingFrames = chargingStatusReader?.onApplicationFrame(frame).orEmpty()
             if (chargingFrames.isNotEmpty()) {
                 session?.writeApplicationFrames(chargingFrames)
@@ -1865,10 +2197,28 @@ class LabActivity : Activity() {
 
     private fun renderCommandState(composer: MiotScooterCommandComposer) {
         if (pendingLockState == null && pendingChargeLimit == null && pendingStartingSpeed == null &&
-            pendingDriveSpeedLimit == null) return
+            pendingDriveSpeedLimit == null && pendingComLogDebug == null && pendingComLogCli == null) return
         when (composer.state) {
                 MiotScooterCommandState.COMPLETED -> {
                     commandTimeoutHandler.removeCallbacks(commandTimeoutRunnable)
+                    pendingComLogCli?.let { command ->
+                        pendingComLogCli = null
+                        setControlsEnabled(true)
+                        comLogValue.text = "CLI '$command' acknowledged; reading log…"
+                        comLogReadHandler.postDelayed(::requestComLog, observedFlowWindowMillis)
+                        return
+                    }
+                    pendingComLogDebug?.let { enabled ->
+                        pendingComLogDebug = null
+                        setControlsEnabled(true)
+                        if (enabled) {
+                            comLogValue.text = "Diagnostic logging enabled; reading log…"
+                            comLogReadHandler.postDelayed(::requestComLog, observedFlowWindowMillis)
+                        } else {
+                            comLogValue.text = "Diagnostic logging disabled."
+                        }
+                        return
+                    }
                     pendingChargeLimit?.let { percentage ->
                         pendingChargeLimit = null
                         pendingChargeVerification = percentage
@@ -2255,6 +2605,10 @@ class LabActivity : Activity() {
 
     private companion object {
         const val logTag = "ScooterLab"
+
+        // The dashboard's streamed log lines are kept in memory only (never persisted or
+        // logged); a static holder lets the preview survive activity recreation.
+        private val comLogStreamBuffer = StringBuilder()
         const val deviceAddressExtra = "device_address"
         const val startExtra = "start_authentication"
         const val laboratoryCredentialFileName = "lab_credential.bin"
