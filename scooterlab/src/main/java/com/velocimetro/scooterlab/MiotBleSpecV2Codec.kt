@@ -785,6 +785,7 @@ class MiotScooterInboundResponseConsumer(private val cipher: MiotBleApplicationC
             startingSpeedValue = extractStartingSpeedValue(plaintext, serviceId, propertyId),
             driveSpeedLimitValue = extractDriveSpeedLimit(plaintext, serviceId, propertyId),
             chargingStatusValue = extractChargingStatusValue(plaintext, serviceId, propertyId),
+            countryCodeValue = extractCountryCode(plaintext, serviceId, propertyId),
         )
         plaintext.fill(0)
         metadata
@@ -814,6 +815,7 @@ data class MiotInboundPayloadMetadata(
     val startingSpeedValue: Int? = null,
     val driveSpeedLimitValue: Int? = null,
     val chargingStatusValue: Int? = null,
+    val countryCodeValue: Int? = null,
 )
 
 /** Extracts Xiaomi Home's `ls` lock flag from authenticated device-information JSON (2.10). */
@@ -933,6 +935,20 @@ private fun extractChargeLimitValue(plaintext: ByteArray, serviceId: Int?, prope
         plaintext.size != 14 || readLittleEndianShort(plaintext, 9) != 0
     ) return null
     return (plaintext.last().toInt() and 0xff).takeIf(MiotScooterChargeLimitReader::isSupported)
+}
+
+/**
+ * Reads the region code carried by the `CountryCode.get.vcu.comm` UART topic. The dashboard
+ * firmware handler (0x020DDA55) copies a 20-byte payload, so the reply is a small integer
+ * region identifier. The mapping to MiOT service/property IDs is provisional until verified
+ * against live traffic; extraction is restricted to values that fit a compact region code.
+ */
+private fun extractCountryCode(plaintext: ByteArray, serviceId: Int?, propertyId: Int?): Int? {
+    if (serviceId != MiotScooterCountryCodeReader.serviceId ||
+        propertyId != MiotScooterCountryCodeReader.propertyId ||
+        plaintext.size < 14
+    ) return null
+    return (plaintext.last().toInt() and 0xff).takeIf { it in 0..255 }
 }
 
 /**

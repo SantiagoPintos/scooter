@@ -155,6 +155,18 @@ class MiotBleSpecV2CodecTest {
     }
 
     @Test
+    fun countryCodeReadAcceptsOnlyMatchingProvisionalProperty() {
+        val reader = MiotScooterCountryCodeReader(MiotBleSpecRequestCounter(), MiotBleApplicationCipher(ByteArray(64)))
+        reader.begin()
+        reader.advanceWithoutFlowAcknowledgement()
+        assertEquals(null, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 10, 0, countryCodeValue = 7)))
+        assertEquals(7, reader.onInboundResponse(
+            MiotInboundPayloadMetadata(30, 30, 2, 3, 1, 2, 11, 0, countryCodeValue = 7)))
+        assertEquals(MiotScooterCountryCodeReader.State.COMPLETED, reader.state)
+    }
+
+    @Test
     fun driveLimitExtractorRetainsOnlyValidDgScalar() {
         val receiverSession = ByteArray(64) { (it + 41).toByte() }
         val senderSession = ByteArray(64)

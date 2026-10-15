@@ -38,3 +38,22 @@ but that is not evidence that changing the UI selection changes the scooter's re
 Record those displayed firmware versions before considering any firmware-level investigation.
 See [Firmware image and flashing assessment](FIRMWARE_RESEARCH.md) for the separate questions of
 OTA image protection, controller MCU identification, and ST-LINK applicability.
+
+## Firmware artifact analysis
+
+The OTA artifacts themselves have now been analyzed offline: the `.mcu` controller package is an
+encrypted + ECDSA-signed Mijia TFOTA container whose AES key could not be recovered from the
+available material (likely eFuse-resident), and the dashboard `.upd` package contains plaintext
+dashboard firmware exposing the BLE↔UART topic table (`CountryCode.set/get.vcu.comm`,
+`d_gear_limit`, `ble.debug.cli` command console). Full details, including the key-search results
+and the UART command surface, are in
+[Firmware encryption research](FIRMWARE_ENCRYPTION_RESEARCH.md). The most feasible next step
+coming out of that analysis is a read-only region-code probe over BLE/UART, not firmware
+modification.
+
+A plaintext VCU image from the same product family (Scooter 6, not 6 Max) has since been
+analyzed statically: the controller-side limit is a config byte initialized to 25 and validated
+against a hardcoded constant, next to a region table (EU1/BU1/EU2) and a UART message
+(`{cmd 11, 50, 25, 0}`) that carries the limit. This is consistent with a regional profile and
+identifies the command shape to look for on the 6 Max dashboard side. Details in
+[VCU firmware research](VCU_FIRMWARE_RESEARCH.md).
