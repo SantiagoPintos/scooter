@@ -126,6 +126,34 @@ remain serial-consistency (binding) and unknown validation behavior for non-seri
 The remaining unmapped area is the config function cluster at `0xC000-0xCC00` (8 functions
 touching the RAM mirror), which is the most likely location of a bulk-config receive path.
 
+## The 20-byte config record decoder (`0xC85C`) — final piece
+
+The bulk-config receive path was found. Function `0xC85C(arg0, arg1)` decodes the 20-byte
+configuration record:
+
+1. The record (20 bytes, stride `5*4` records at `sp+8`) is fetched via the field reader
+   `0xC64C(i, table[i], 12, record)`; `arg1 > 10` aborts.
+2. **The record is unpacked as 10 little-endian u16 values** (`record[2i] | record[2i+1]<<8`).
+3. Each value is applied as `applied = (calibration[i] * value) / 1000` — wait, precisely:
+   `r6 = (table_u16[i] * value_u16) / 1000`.
+4. **A zero-value counter guards the application**: when a value is 0, an error counter
+   increments and **saturates at 50 (`0x32`)**; a valid value resets it to 0.
+5. The applied value is then adjusted by the **signed per-unit offset byte at config offset
+   `0xD`** (same 15-byte struct whose offset `0xB` holds the speed limit): positive offset
+   adds, negative subtracts, and the result clamps at 0.
+
+So a hypothetical 20-byte `CountryCode.set` payload would flow through: record fetch →
+10× u16 unpack → calibration division → zero-value counter (saturating at 50) → signed
+offset trim → config application → and finally the main-loop consistency validator that
+reverts the speed byte (`0xB`) to 25 whenever it differs.
+
+Consequence for the original question: there is no single field in this path that maps a
+"country code" to a speed ceiling. The constant 25 appears independently in (a) the default
+writer, (b) the main-loop validator, and (c) the calibration/offset structure surrounding
+the applied values. Forcing 32 through this channel would require a payload that satisfies
+three separate validation layers designed to hold the certified limit — and the observed
+value (`ss=3`) reaching the dashboard is produced by the VCU itself, upstream of all of it.
+
 ## Safety note
 
 The diagnostic flags (`6.1`, CLI `logon`) were left enabled on the test scooter during this
